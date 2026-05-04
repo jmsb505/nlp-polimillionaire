@@ -1,0 +1,8 @@
+requests>=2.31
+pytest>=8.0
+packaging>=23.0
+transformers>=5.7.0
+torch>=2.2
+torchvision>=0.17
+accelerate>=0.30
+huggingface_hub>=1.13.0
