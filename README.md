@@ -62,11 +62,3 @@ results/runs/
 ```powershell
 python -m pytest
 ```
-
-## Submission
-
-- fill group names and emails;
-- add the video link;
-- add the academic integrity statement;
-- run the useful notebook outputs cleanly;
-- export to HTML.
