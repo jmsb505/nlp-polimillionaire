@@ -15,7 +15,7 @@ This is the repo in plain English.
 
 - `notebooks/` contains the notebooks we actually run.
 - `notebooks/sample_notebook.ipynb` tests selected local models on one sample question.
-- `notebooks/game_testing_notebook.ipynb` runs selected local models through the real game API one after another.
+- `notebooks/game_testing_notebook.ipynb` runs selected local models through the real game API one after another, with an optional 4-bit mixed council entry.
 
 ## `src/`
 
@@ -26,17 +26,17 @@ This is the repo in plain English.
 - `src/polimillionaire/` contains the few helper modules we wrote for the assignment.
 - `src/polimillionaire/__init__.py` makes the main helpers easy to import.
 - `src/polimillionaire/types.py` defines the shared question, option, and answer dataclasses.
-- `src/polimillionaire/strategies.py` contains model loading, prompt building, output parsing, and answer strategies.
+- `src/polimillionaire/strategies.py` contains Gemma and Qwen loading, optional 4-bit quantization, prompts, parsing, and council selection.
 - `src/polimillionaire/runner.py` contains the live game runner, safe delay, fallback logic, JSONL logging, and result summaries.
 
 ## `millionaire_client/`
 
-- `millionaire_client/` is the provided API client, kept unchanged.
+- `millionaire_client/` is the provided API client, updated from the supplied ZIP and kept separate from our helpers.
 - `millionaire_client/__init__.py` exposes the provided client package.
 - `millionaire_client/base.py` handles the low-level HTTP requests.
 - `millionaire_client/client.py` is the main client object used by the notebook.
 - `millionaire_client/auth.py` handles login and authentication.
-- `millionaire_client/game.py` handles game sessions, questions, and answer submission.
+- `millionaire_client/game.py` handles text or speech game sessions, question audio, and answer submission.
 - `millionaire_client/competitions.py` lists and reads competition data.
 - `millionaire_client/leaderboard.py` reads leaderboard data.
 - `millionaire_client/models.py` defines the client-side response models.
@@ -51,6 +51,8 @@ This is the repo in plain English.
 - `tests/test_game_runner.py` checks fallback behavior, live-run logging, and submission-error handling.
 - `tests/test_evaluation.py` checks the result summary helper.
 - `tests/test_gemma_smoke.py` is an optional real Gemma test that only runs when explicitly enabled.
+- `tests/test_qwen_smoke.py` is an optional real Qwen thinking test that only runs when explicitly enabled.
+- `tests/test_quantized_council_smoke.py` is an optional real 4-bit Gemma and Qwen council test for a CUDA machine with `bitsandbytes`.
 
 ## `results/`
 
@@ -63,4 +65,4 @@ This is the repo in plain English.
 ## `data/`
 
 - `data/` stores local model/cache files and is mostly ignored by git.
-- `data/hf_home/` is the local Hugging Face cache where Gemma weights can live.
+- `data/hf_home/` is the local Hugging Face cache where model weights can live.

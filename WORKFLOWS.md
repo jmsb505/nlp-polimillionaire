@@ -10,7 +10,7 @@ Keep it simple: run the notebook, edit helpers only when needed.
 4. Run the selected local models on the sample question.
 5. Open `notebooks/game_testing_notebook.ipynb`.
 6. Pick models and competition.
-7. Login and run one live game.
+7. Login and run the selected models one after another.
 8. Read `results/runs/`.
 
 ## Add A New Heuristic
@@ -55,21 +55,39 @@ Useful small ideas:
 
 Keep it fast.
 
-## Change Gemma Prompting
+## Change Model Prompting
 
-Edit `build_prompt()` in `strategies.py`.
+Edit `build_prompt()` for Gemma or `build_qwen_prompt()` for Qwen thinking in `strategies.py`.
 
 Keep the prompt short:
 
 - one answer only;
 - one-line JSON;
-- no long reasoning.
+- no long reasoning for Gemma; Qwen is the thinking experiment.
 
 After editing:
 
 1. run tests;
 2. run the model test notebook;
 3. run the game notebook only if `fallback: False`.
+
+## Try The Council
+
+In a notebook model list, set `run=True` for `Gemma 4 E2B Council`.
+
+It runs one loaded Gemma model three times with sampling and different seeds. A majority answer is used directly. The deterministic judge is only used if the votes do not have a majority.
+
+Use the sample notebook first. In a live game it makes four generations per question, so latency matters.
+
+For a different model perspective, choose `Gemma + Qwen Mixed Council (4-bit)` in the game notebook. Install `bitsandbytes` in that notebook kernel first:
+
+```python
+%pip install -U bitsandbytes
+```
+
+It uses the class NF4/double-quantization recipe so Gemma and short non-thinking Qwen can fit together more reliably. It is another `MODELS_TO_RUN` choice, not a separate pipeline. Turn on `RUN_OFFLINE_BENCHMARK` before running this option live.
+
+To compare it fairly, run `Gemma 4 E2B (4-bit)` and `Gemma + Qwen Mixed Council (4-bit)` with `RUN_LIVE_GAME = False`. Only this quantized mixed option restricts its judge to candidate answers and falls back to the Gemma vote instead of comparing model confidence scores. Existing council choices keep their earlier behavior.
 
 ## Change Live Game Logic
 
