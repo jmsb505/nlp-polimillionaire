@@ -8,6 +8,10 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, fields
 from typing import Any, Protocol
+from langchain_core.tools import tool, render_text_description
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
+from typing import Dict, Any, Optional
 
 from packaging.version import Version
 
@@ -154,6 +158,33 @@ class GemmaLLM:
         else:
             raise ValueError(f"Unsupported inference_backend: {self.config.inference_backend}")
         return text.strip()
+    
+    def invoke(self, input_data: Any, config: Any = None) -> Any:
+        from langchain_core.outputs import ChatResult, ChatGeneration
+        from langchain_core.messages import BaseMessage
+        
+    
+        if hasattr(input_data, "to_string"):
+            prompt_text = input_data.to_string()
+        elif isinstance(input_data, list) and len(input_data) > 0:
+            prompt_text = getattr(input_data[-1], "content", str(input_data))
+        else:
+            prompt_text = str(input_data)
+            
+        generated_text = self.generate(prompt_text)
+        
+    
+        class CustomContent:
+            def __init__(self, text):
+                self.content = [{'text': text}]
+                self.text_content = text
+            @property
+            def str_output(self):
+                return self.text_content
+            def __str__(self):
+                return self.text_content
+                g
+        return CustomContent(generated_text)
 
     def _load(self) -> None:
         if self.is_loaded:
@@ -301,6 +332,33 @@ class QwenLLM:
             output_ids = self._model.generate(**inputs, **generation_kwargs)
         generated_ids = output_ids[0][input_length:]
         return self._processor.decode(generated_ids, skip_special_tokens=True).strip()
+    
+    def invoke(self, input_data: Any, config: Any = None) -> Any:
+    
+        from langchain_core.outputs import ChatResult, ChatGeneration
+        from langchain_core.messages import BaseMessage
+        
+    
+        if hasattr(input_data, "to_string"):
+            prompt_text = input_data.to_string()
+        elif isinstance(input_data, list) and len(input_data) > 0:
+            prompt_text = getattr(input_data[-1], "content", str(input_data))
+        else:
+            prompt_text = str(input_data)
+            
+        generated_text = self.generate(prompt_text)
+        
+        class CustomContent:
+            def __init__(self, text):
+                self.content = [{'text': text}]
+                self.text_content = text
+            @property
+            def str_output(self):
+                return self.text_content
+            def __str__(self):
+                return self.text_content
+                g
+        return CustomContent(generated_text)
 
     def _load(self) -> None:
         if self.is_loaded:
@@ -803,3 +861,150 @@ def _quantization_kwargs(quantize_4bit: bool) -> dict[str, Any]:
 
 def _words(text: str) -> list[str]:
     return re.findall(r"[A-Za-z0-9]+", text.lower())
+
+
+@tool
+def calculator_tool(expression: str) -> float:
+    """
+    Computes mathematical operations, this tool does.
+    An argument it takes, a basic Python math string like '2 + 2' or '1.95 ** 10' it must be.
+    """
+    clean_expr = re.sub(r'[^0-9\+\-\*\/\(\)\.\s]', '', expression)
+    return float(eval(clean_expr, {"__builtins__": None}, {}))
+
+@tool
+def wikipedia_tool(search_term: str) -> str:
+    """
+    Historical facts, biographies or general knowledge, this tool finds.
+    A single entity or concept as search_term string, it requires.
+    """
+    try:
+        import urllib.request
+        import urllib.parse
+        from bs4 import BeautifulSoup
+        
+        query = urllib.parse.quote(search_term.strip())
+        url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={query}&format=json"
+        req = urllib.request.Request(url, headers={'User-Agent': 'PoliMillionaireAgent/1.0'})
+        
+        with urllib.request.urlopen(req, timeout=4) as response:
+            data = json.loads(response.read().decode())
+            
+        results = data.get("query", {}).get("search", [])
+        if not results:
+            return "No information found in Wikipedia."
+            
+        snippet = BeautifulSoup(results[0].get("snippet", ""), "html.parser").get_text()
+        return f"Fact context found: {snippet}"
+    except Exception as e:
+        return f"Error during search: {str(e)}"
+
+
+
+class LangChainAgenticStrategy(BaseStrategy):
+    name = "langchain_agent"
+
+    def __init__(self, raw_llm: LocalLLM, fallback_strategy: BaseStrategy | None = None):
+        # Wraps your existing LocalLLM (Gemma/Qwen) into a LangChain compatible interface
+        self.raw_llm = raw_llm
+        self.fallback = fallback_strategy or HeuristicStrategy()
+        self.tools = [calculator_tool, wikipedia_tool]
+        self._setup_agent_prompts()
+
+    def _setup_agent_prompts(self):
+        rendered_tools = render_text_description(self.tools)
+        
+        system_routing = f"""\
+You are an advanced orchestrator for the quiz game 'Who wants to be a PoliMillionaire?'.
+Your job is to decide if you need an external tool to answer the question accurately.
+
+Here are the names and descriptions for each tool available:
+{rendered_tools}
+
+Given the question, you must return a JSON blob with 'name' and 'arguments' keys.
+If you DO NOT need a tool to answer the question, you MUST set 'name': "none" and 'arguments': {{"query": ""}}.
+If you need a tool, choose one from the list.
+
+The response format MUST be exactly a valid JSON block like this:
+{{"name": "tool_name", "arguments": {{"expression": "2+2"}}}}
+"""
+        self.routing_prompt = ChatPromptTemplate.from_messages([
+            ("system", system_routing),
+            ("user", "Question: {input}\nOptions: {options_text}")
+        ])
+
+        system_answering = """\
+You are a brilliant contestant playing 'Who wants to be a PoliMillionaire?'.
+Additional verified context from your tools: {context}
+
+Analyze the question and select the single best option ID.
+You MUST return your response ONLY as a JSON blob matching this structure:
+{{"option_id": 0, "confidence": 0.95, "reasoning": "Your step-by-step logic here"}}
+"""
+        self.answer_prompt = ChatPromptTemplate.from_messages([
+            ("system", system_answering),
+            ("user", "Question: {input}\nOptions:\n{options_text}")
+        ])
+
+    def _invoke_tool(self, tool_name: str, tool_args: dict) -> str:
+        if tool_name == "none" or not tool_name:
+            return "No additional context needed."
+            
+        tool_map = {t.name: t for t in self.tools}
+        if tool_name in tool_map:
+            try:
+                result = tool_map[tool_name].invoke(tool_args)
+                return str(result)
+            except Exception as e:
+                return f"Tool execution failed: {str(e)}"
+        return "Unknown tool requested."
+
+    def answer(self, question: Question) -> AnswerPrediction:
+        try:
+            options_str = "\n".join([f"ID {o.id}: {o.text}" for o in question.options])
+            
+            # --- PHASE 1: TOOL ROUTING ---
+            # Use LangChain pipe syntax to call the local wrapper model
+            routing_chain = self.routing_prompt | self.raw_llm | JsonOutputParser()
+            
+            routing_res = routing_chain.invoke({
+                "input": question.text,
+                "options_text": options_str
+            })
+            
+            tool_name = routing_res.get("name", "none")
+            tool_arguments = routing_res.get("arguments", {})
+            
+            # --- PHASE 2: TOOL EXECUTION ---
+            context_data = self._invoke_tool(tool_name, tool_arguments)
+            
+            # --- PHASE 3: FINAL ANSWER GENERATION ---
+            answer_chain = self.answer_prompt | self.raw_llm | JsonOutputParser()
+            final_res = answer_chain.invoke({
+                "context": context_data,
+                "input": question.text,
+                "options_text": options_str
+            })
+            
+            selected_id = int(final_res["option_id"])
+            chosen_option = next((o for o in question.options if o.id == selected_id), question.options[0])
+            
+            return AnswerPrediction(
+                option_id=chosen_option.id,
+                answer_text=chosen_option.text,
+                confidence=float(final_res.get("confidence", 0.7)),
+                reasoning=str(final_res.get("reasoning", "Decided using LangChain Agent pipeline.")),
+                metadata={
+                    "strategy": self.name,
+                    "used_tool": tool_name,
+                    "tool_arguments": str(tool_arguments),
+                    "tool_output": context_data
+                }
+            )
+            
+        except Exception as e:
+            print(f"[LangChainAgent] Error captured, deploying fallback: {str(e)}")
+            fallback_pred = self.fallback.answer(question)
+            fallback_pred.metadata["fallback"] = True
+            fallback_pred.metadata["fallback_reason"] = str(e)
+            return fallback_pred
