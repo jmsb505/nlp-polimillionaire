@@ -914,7 +914,7 @@ class LangChainAgenticStrategy(BaseStrategy):
     def _setup_agent_prompts(self):
         rendered_tools = render_text_description(self.tools)
         
-        system_routing = f"""\
+        system_routing = f"""
 You are an advanced orchestrator for the quiz game 'Who wants to be a PoliMillionaire?'.
 Your job is to decide if you need an external tool to answer the question accurately.
 
@@ -930,21 +930,21 @@ The response format MUST be exactly a valid JSON block like this:
 """
         self.routing_prompt = ChatPromptTemplate.from_messages([
             ("system", system_routing),
-            ("user", "Question: {input}\nOptions: {options_text}")
-        ])
+            ("user", "Question: {{input}}\nOptions: {{options_text}}")
+        ], template_format="jinja2")
 
-        system_answering = """\
+        system_answering = """
 You are a brilliant contestant playing 'Who wants to be a PoliMillionaire?'.
-Additional verified context from your tools: {context}
+Additional verified context from your tools: {{context}}
 
 Analyze the question and select the single best option ID.
 You MUST return your response ONLY as a JSON blob matching this structure:
-{{"option_id": 0, "confidence": 0.95, "reasoning": "Your step-by-step logic here"}}
+{"option_id": 0, "confidence": 0.95, "reasoning": "Your step-by-step logic here"}
 """
         self.answer_prompt = ChatPromptTemplate.from_messages([
             ("system", system_answering),
-            ("user", "Question: {input}\nOptions:\n{options_text}")
-        ])
+            ("user", "Question: {{input}}\nOptions:\n{{options_text}}")
+        ], template_format="jinja2")
 
     def _invoke_tool(self, tool_name: str, tool_args: dict) -> str:
         if tool_name == "none" or not tool_name:
