@@ -5,6 +5,7 @@ from types import ModuleType
 
 import torch
 
+import polimillionaire.strategies as strategies_module
 from polimillionaire.strategies import (
     CouncilStrategy,
     FakeLLM,
@@ -18,6 +19,12 @@ from polimillionaire.strategies import (
     RandomStrategy,
     build_council_vote_prompt,
 )
+
+
+def test_rag_models_are_lazy_loaded_on_import():
+    assert strategies_module._RAG_RUNTIME_READY is False
+    assert strategies_module._RAG_EMBED_MODEL is None
+    assert strategies_module._RAG_CROSS_ENCODER is None
 
 
 def test_random_strategy_contract(sample_question):

@@ -18,6 +18,8 @@ def test_game_notebook_has_safe_default_switches_and_valid_code():
     assert "RUN_LIVE_GAME = False" in code
     assert "RUN_OFFLINE_BENCHMARK = True" in code
     assert "MODELS_TO_RUN = [" in code
+    assert '"run": True' not in code
     assert '"kind": "gemma_quantized"' in code
     assert '"kind": "mixed_quantized"' in code
+    assert "RoutedStrategy" in code
     assert "loaded-model speed check:" in code

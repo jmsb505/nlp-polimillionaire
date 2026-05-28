@@ -167,6 +167,40 @@ def summarize_attempts(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def benchmark_strategy(strategy: BaseStrategy, cases: list[tuple[Question, int]]) -> dict[str, Any]:
+    rows = []
+    for question, gold_id in cases:
+        started_at = time.monotonic()
+        prediction = strategy.answer(question)
+        elapsed = time.monotonic() - started_at
+        votes = prediction.metadata.get("votes") or []
+        vote_options = {vote.get("option_id") for vote in votes if isinstance(vote, dict)}
+        rows.append(
+            {
+                "question_id": question.id,
+                "prediction": prediction,
+                "gold_id": gold_id,
+                "correct": prediction.option_id == gold_id,
+                "elapsed_seconds": elapsed,
+                "fallback": bool(prediction.metadata.get("fallback")),
+                "disagreement": len(vote_options) > 1,
+            }
+        )
+
+    total = len(rows)
+    elapsed_values = [row["elapsed_seconds"] for row in rows]
+    return {
+        "total": total,
+        "correct": sum(1 for row in rows if row["correct"]),
+        "accuracy": sum(1 for row in rows if row["correct"]) / total if total else 0.0,
+        "fallbacks": sum(1 for row in rows if row["fallback"]),
+        "avg_elapsed_seconds": sum(elapsed_values) / total if total else 0.0,
+        "max_elapsed_seconds": max(elapsed_values) if elapsed_values else 0.0,
+        "disagreements": sum(1 for row in rows if row["disagreement"]),
+        "rows": rows,
+    }
+
+
 def _fallback_prediction(question: Question, reason: str) -> AnswerPrediction:
     option = question.first_option()
     return AnswerPrediction(

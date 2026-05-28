@@ -7,39 +7,25 @@ import random
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, fields
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from langchain_core.tools import tool, render_text_description
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
-from typing import Dict, Any, Optional
 
 import asyncio
 import hashlib
 import time
 import logging
 
-import httpx
-import nest_asyncio
-import numpy as np
-import trafilatura
-from ddgs import DDGS
-from langchain_community.retrievers import BM25Retriever
-from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from sentence_transformers import CrossEncoder, SentenceTransformer
-
 from packaging.version import Version
 
 from polimillionaire.types import AnswerPrediction, Question
 
 
-try:
-    from newspaper import Article as NewspaperArticle
-    HAS_NEWSPAPER = True
-except ImportError:
-    HAS_NEWSPAPER = False
-
-nest_asyncio.apply()
+@dataclass(frozen=True)
+class RouteDecision:
+    route: str
+    reason: str
 
 
 class BaseStrategy(ABC):
@@ -83,6 +69,68 @@ class HeuristicStrategy(BaseStrategy):
             reasoning="Simple word-overlap heuristic selected the option.",
             metadata={"strategy": self.name},
         )
+
+
+def route_question(question: Question) -> RouteDecision:
+    text = f"{question.text} " + " ".join(option.text for option in question.options)
+    lowered = text.lower()
+    if _looks_like_math(lowered):
+        return RouteDecision("direct", "math")
+    if _has_negation_trap(lowered):
+        return RouteDecision("direct", "negation")
+    if _looks_factual(lowered):
+        return RouteDecision("rag", "factual")
+    return RouteDecision("fallback", "general")
+
+
+class RoutedStrategy(BaseStrategy):
+    name = "routed"
+
+    def __init__(
+        self,
+        direct_strategy: BaseStrategy,
+        rag_strategy: BaseStrategy | None = None,
+        fallback_strategy: BaseStrategy | None = None,
+        low_confidence_strategy: BaseStrategy | None = None,
+        rag_min_confidence: float | None = None,
+    ):
+        self.direct_strategy = direct_strategy
+        self.rag_strategy = rag_strategy
+        self.fallback_strategy = fallback_strategy or direct_strategy
+        self.low_confidence_strategy = low_confidence_strategy
+        self.rag_min_confidence = rag_min_confidence
+
+    def answer(self, question: Question) -> AnswerPrediction:
+        decision = route_question(question)
+        if decision.route == "rag" and self.rag_strategy is not None:
+            strategy = self.rag_strategy
+        elif decision.route == "direct":
+            strategy = self.direct_strategy
+        else:
+            strategy = self.fallback_strategy
+        prediction = strategy.answer(question)
+        prediction.metadata["route"] = decision.route
+        prediction.metadata["route_reason"] = decision.reason
+        prediction.metadata["routed_to"] = getattr(strategy, "name", strategy.__class__.__name__)
+        if (
+            decision.route == "rag"
+            and self.low_confidence_strategy is not None
+            and self.rag_min_confidence is not None
+            and (prediction.confidence is None or prediction.confidence < self.rag_min_confidence)
+        ):
+            backup = self.low_confidence_strategy.answer(question)
+            backup.metadata["route"] = decision.route
+            backup.metadata["route_reason"] = decision.reason
+            backup.metadata["routed_to"] = getattr(self.low_confidence_strategy, "name", "backup")
+            backup.metadata["backup_for_low_confidence_rag"] = True
+            backup.metadata["rag_prediction"] = {
+                "option_id": prediction.option_id,
+                "confidence": prediction.confidence,
+                "reasoning": prediction.reasoning,
+                "metadata": prediction.metadata,
+            }
+            return backup
+        return prediction
 
 
 class LocalLLM(Protocol):
@@ -597,24 +645,35 @@ class CouncilStrategy(BaseStrategy):
 
 def build_prompt(question: Question) -> str:
     options = "\n".join(f"{option.id}) {option.text}" for option in question.options)
+    negation_note = (
+        "The question contains NOT or EXCEPT. Select the option that does not fit."
+        if _has_negation_trap(question.text.lower())
+        else "Select the single best option."
+    )
     return "\n\n".join(
         [
-            "Pick the best answer. Return only the option id number.",
-            f"Q: {question.text}",
+            "Answer the multiple-choice question.",
+            negation_note,
+            "Return exactly: option_id: <number>",
+            f"Question: {question.text}",
             options,
-            "Answer:",
         ]
     )
 
 
 def build_qwen_prompt(question: Question) -> str:
     options = "\n".join(f"{option.id}) {option.text}" for option in question.options)
+    negation_note = (
+        "Important: NOT/EXCEPT means choose the option that does not fit."
+        if _has_negation_trap(question.text.lower())
+        else "Choose the best answer."
+    )
     return "\n\n".join(
         [
-            "Choose the best answer to this multiple-choice question.",
-            f"Q: {question.text}",
+            negation_note,
+            f"Question: {question.text}",
             options,
-            "After thinking, finish with exactly: option_id: <number>",
+            "Finish with exactly: option_id: <number>",
         ]
     )
 
@@ -864,6 +923,56 @@ def _quantization_kwargs(quantize_4bit: bool) -> dict[str, Any]:
 
 def _words(text: str) -> list[str]:
     return re.findall(r"[A-Za-z0-9]+", text.lower())
+
+
+def _looks_like_math(text: str) -> bool:
+    math_words = {
+        "calculate",
+        "calculation",
+        "sum",
+        "difference",
+        "product",
+        "divide",
+        "multiply",
+        "plus",
+        "minus",
+        "percent",
+        "percentage",
+        "probability",
+        "average",
+    }
+    if re.search(r"\d+\s*[\+\-\*/]\s*\d+", text):
+        return True
+    return any(word in _words(text) for word in math_words)
+
+
+def _has_negation_trap(text: str) -> bool:
+    return bool(re.search(r"\b(not|except|least|incorrect|false)\b", text.lower()))
+
+
+def _looks_factual(text: str) -> bool:
+    factual_words = {
+        "which",
+        "who",
+        "when",
+        "where",
+        "what",
+        "according",
+        "song",
+        "album",
+        "film",
+        "movie",
+        "actor",
+        "actress",
+        "artist",
+        "history",
+        "born",
+        "written",
+        "known",
+        "describes",
+        "influence",
+    }
+    return any(word in _words(text) for word in factual_words)
 
 
 @tool
@@ -1137,19 +1246,67 @@ You MUST return your response ONLY as a JSON blob matching this structure:
 
 _rag_log = logging.getLogger(f"{__name__}.rag")
 
-# Splitter is fixed at module level; chunk_size/overlap are not runtime-tunable
-# without reloading the module. RAGConfig exposes them for documentation only.
-_RAG_SPLITTER = RecursiveCharacterTextSplitter(
-    chunk_size=450,
-    chunk_overlap=80,
-    separators=["\n\n", "\n", ". ", " ", ""],
-)
+_RAG_SPLITTER: Any = None
 
-_rag_log.info("RAG: loading dense encoder …")
-_RAG_EMBED_MODEL = SentenceTransformer("BAAI/bge-small-en-v1.5")
+_RAG_EMBED_MODEL: Any = None
 
-_rag_log.info("RAG: loading cross-encoder …")
-_RAG_CROSS_ENCODER = CrossEncoder("BAAI/bge-reranker-base")
+_RAG_CROSS_ENCODER: Any = None
+_RAG_RUNTIME_READY = False
+HAS_NEWSPAPER = False
+NewspaperArticle: Any = None
+
+
+def _ensure_rag_runtime() -> None:
+    global _RAG_SPLITTER, _RAG_EMBED_MODEL, _RAG_CROSS_ENCODER
+    global _RAG_RUNTIME_READY, HAS_NEWSPAPER, NewspaperArticle
+    global httpx, np, trafilatura, DDGS, BM25Retriever, Document
+
+    if _RAG_RUNTIME_READY:
+        return
+
+    try:
+        import httpx as _httpx
+        import nest_asyncio
+        import numpy as _np
+        import trafilatura as _trafilatura
+        from ddgs import DDGS as _DDGS
+        from langchain_community.retrievers import BM25Retriever as _BM25Retriever
+        from langchain_core.documents import Document as _Document
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        from sentence_transformers import CrossEncoder, SentenceTransformer
+    except ImportError as exc:
+        raise RuntimeError(
+            "RAG needs optional packages: ddgs, httpx, trafilatura, langchain-community, "
+            "langchain-text-splitters, sentence-transformers, and rank_bm25."
+        ) from exc
+
+    try:
+        from newspaper import Article as _NewspaperArticle
+
+        NewspaperArticle = _NewspaperArticle
+        HAS_NEWSPAPER = True
+    except ImportError:
+        NewspaperArticle = None
+        HAS_NEWSPAPER = False
+
+    nest_asyncio.apply()
+    httpx = _httpx
+    np = _np
+    trafilatura = _trafilatura
+    DDGS = _DDGS
+    BM25Retriever = _BM25Retriever
+    Document = _Document
+
+    _RAG_SPLITTER = RecursiveCharacterTextSplitter(
+        chunk_size=450,
+        chunk_overlap=80,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+    _rag_log.info("RAG: loading dense encoder")
+    _RAG_EMBED_MODEL = SentenceTransformer("BAAI/bge-small-en-v1.5")
+    _rag_log.info("RAG: loading cross-encoder")
+    _RAG_CROSS_ENCODER = CrossEncoder("BAAI/bge-reranker-base")
+    _RAG_RUNTIME_READY = True
 
 
 # ===============================================================================
@@ -1160,30 +1317,30 @@ _RAG_CROSS_ENCODER = CrossEncoder("BAAI/bge-reranker-base")
 @dataclass
 class RAGConfig:
     # Search
-    max_ddg_results: int = 7
-    timeout_ddg: int = 10
+    max_ddg_results: int = 4
+    timeout_ddg: int = 5
     # Extra query variants generated on top of the original query (0 = disabled)
     num_extra_queries: int = 1
 
     # Fetching
-    fetch_timeout: float = 8.0
-    max_concurrent_fetches: int = 6
-    max_text_chars: int = 20_000
-    total_fetch_budget: float = 9.0      # hard wall-clock cap for the fetch phase
+    fetch_timeout: float = 4.0
+    max_concurrent_fetches: int = 4
+    max_text_chars: int = 12_000
+    total_fetch_budget: float = 5.0      # hard wall-clock cap for the fetch phase
 
     # Retrieval
-    bm25_top_k: int = 10
-    dense_top_k: int = 10
+    bm25_top_k: int = 6
+    dense_top_k: int = 6
     rrf_k: int = 60                      # standard RRF constant
     diversity_max_per_url: int = 2
 
     # Reranking
     # RAGStrategy overrides this when calling llm.generate(), 
     # so the LLM config default no longer matters.
-    answer_max_new_tokens: int = 128
+    answer_max_new_tokens: int = 96
 
     # Reranking
-    final_top_k: int = 5
+    final_top_k: int = 3
 
 
 # ===============================================================================
@@ -1201,7 +1358,10 @@ Question: {query}"""
 # instead of {evidence}/{question}/{options} with str.format(), which raises
 # KeyError if any option text or evidence chunk contains literal braces { }.
 _RAG_ANSWER_PROMPT = """\
-Answer this multiple-choice question using the evidence below.
+Answer this multiple-choice question using only the evidence below when it is relevant.
+If the question contains NOT or EXCEPT, choose the option that is not supported or does not fit.
+Options may overlap. Choose the exact listed option fully supported by the evidence, not a shorter related option.
+If the question asks what caused or led to something, choose the earlier cause, not the later action.
 Return ONLY a JSON object with keys: option_id, confidence, reason.
 
 Evidence:
@@ -1478,12 +1638,26 @@ def _rag_format_evidence(docs: list[Document]) -> str:
     return "\n\n".join(blocks)
 
 
+def _rag_evidence_sources(docs: list[Any]) -> list[dict[str, str]]:
+    sources = []
+    for doc in docs:
+        sources.append(
+            {
+                "title": str(doc.metadata.get("title", ""))[:160],
+                "url": str(doc.metadata.get("url", ""))[:300],
+                "preview": " ".join(str(doc.page_content).split())[:300],
+            }
+        )
+    return sources
+
+
 # ===============================================================================
 # PIPELINE (internal, called by RAGStrategy)
 # ===============================================================================
 
 
-def _rag_retrieve(query: str, cfg: RAGConfig, llm: LocalLLM) -> str:
+def _rag_retrieve(query: str, cfg: RAGConfig, llm: LocalLLM) -> tuple[str, list[Any], float]:
+    _ensure_rag_runtime()
     t0 = time.perf_counter()
 
     # 1. Query expansion using the local LLM
@@ -1492,12 +1666,14 @@ def _rag_retrieve(query: str, cfg: RAGConfig, llm: LocalLLM) -> str:
     # 2. Web search across all variants
     raw_results = _rag_search_all(queries, cfg)
     if not raw_results:
-        return "No results found."
+        elapsed = time.perf_counter() - t0
+        return "No results found.", [], elapsed
 
     # 3. Parallel async fetch with hard time budget
     docs = _rag_fetch_all(raw_results, cfg)
     if not docs:
-        return "No results found."
+        elapsed = time.perf_counter() - t0
+        return "No results found.", [], elapsed
 
     # 4. Hybrid BM25 + dense + RRF fusion
     fused_docs = _rag_hybrid_retrieve(query, docs, cfg)
@@ -1508,8 +1684,9 @@ def _rag_retrieve(query: str, cfg: RAGConfig, llm: LocalLLM) -> str:
     # 6. Cross-encoder rerank on the diverse candidate set
     top_docs = _rag_cross_encode_rerank(query, diverse_docs, cfg)
 
-    _rag_log.info("RAG retrieve() done in %.2fs → %d chunks", time.perf_counter() - t0, len(top_docs))
-    return _rag_format_evidence(top_docs)
+    elapsed = time.perf_counter() - t0
+    _rag_log.info("RAG retrieve() done in %.2fs -> %d chunks", elapsed, len(top_docs))
+    return _rag_format_evidence(top_docs), top_docs, elapsed
 
 
 # ===============================================================================
@@ -1542,23 +1719,27 @@ class RAGStrategy(BaseStrategy):
         llm: LocalLLM,
         retrieval_config: RAGConfig | None = None,
         fallback_strategy: BaseStrategy | None = None,
+        retriever: Callable[[str, RAGConfig, LocalLLM], tuple[str, list[Any], float]] | None = None,
     ):
         self.llm = llm
         self.cfg = retrieval_config or RAGConfig()
         self.fallback = fallback_strategy or HeuristicStrategy()
+        self.retriever = retriever or _rag_retrieve
 
     def answer(self, question: Question) -> AnswerPrediction:
         try:
-            evidence = _rag_retrieve(question.text, self.cfg, self.llm)
+            evidence, evidence_docs, retrieval_seconds = self.retriever(question.text, self.cfg, self.llm)
             prompt = build_rag_prompt(question, evidence)
-            # Override max_new_tokens here instead of relying on the LLM config default
             raw_text = self.llm.generate(prompt, max_new_tokens=self.cfg.answer_max_new_tokens)
             prediction = parse_answer_prediction(raw_text, question, strategy_name=self.name)
             prediction.metadata.update({
                 "strategy": self.name,
                 "model_name": getattr(self.llm, "model_name", "unknown"),
                 "device": getattr(self.llm, "device_summary", "unknown"),
-                "num_evidence_chunks": self.cfg.final_top_k,
+                "num_evidence_chunks": len(evidence_docs),
+                "retrieval_seconds": round(retrieval_seconds, 2),
+                "evidence_preview": evidence[:1200],
+                "evidence_sources": _rag_evidence_sources(evidence_docs),
             })
             return prediction
 
