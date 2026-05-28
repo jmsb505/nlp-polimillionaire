@@ -13,9 +13,33 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from typing import Dict, Any, Optional
 
+import asyncio
+import hashlib
+import time
+import logging
+
+import httpx
+import nest_asyncio
+import numpy as np
+import trafilatura
+from ddgs import DDGS
+from langchain_community.retrievers import BM25Retriever
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from sentence_transformers import CrossEncoder, SentenceTransformer
+
 from packaging.version import Version
 
 from polimillionaire.types import AnswerPrediction, Question
+
+
+try:
+    from newspaper import Article as NewspaperArticle
+    HAS_NEWSPAPER = True
+except ImportError:
+    HAS_NEWSPAPER = False
+
+nest_asyncio.apply()
 
 
 class BaseStrategy(ABC):
@@ -1007,4 +1031,448 @@ You MUST return your response ONLY as a JSON blob matching this structure:
             fallback_pred = self.fallback.answer(question)
             fallback_pred.metadata["fallback"] = True
             fallback_pred.metadata["fallback_reason"] = str(e)
+            return fallback_pred
+
+
+
+# ==============================================================================
+# RAG STRATEGY
+# ==============================================================================
+
+# ===============================================================================
+# MODULE-LEVEL SINGLETONS  — loaded once at import, shared across all instances
+# ===============================================================================
+
+_rag_log = logging.getLogger(f"{__name__}.rag")
+
+# Splitter is fixed at module level; chunk_size/overlap are not runtime-tunable
+# without reloading the module. RAGConfig exposes them for documentation only.
+_RAG_SPLITTER = RecursiveCharacterTextSplitter(
+    chunk_size=450,
+    chunk_overlap=80,
+    separators=["\n\n", "\n", ". ", " ", ""],
+)
+
+_rag_log.info("RAG: loading dense encoder …")
+_RAG_EMBED_MODEL = SentenceTransformer("BAAI/bge-small-en-v1.5")
+
+_rag_log.info("RAG: loading cross-encoder …")
+_RAG_CROSS_ENCODER = CrossEncoder("BAAI/bge-reranker-base")
+
+
+# ===============================================================================
+# CONFIG
+# ===============================================================================
+
+
+@dataclass
+class RAGConfig:
+    # Search
+    max_ddg_results: int = 7
+    timeout_ddg: int = 10
+    # Extra query variants generated on top of the original query (0 = disabled)
+    num_extra_queries: int = 1
+
+    # Fetching
+    fetch_timeout: float = 8.0
+    max_concurrent_fetches: int = 6
+    max_text_chars: int = 20_000
+    total_fetch_budget: float = 9.0      # hard wall-clock cap for the fetch phase
+
+    # Retrieval
+    bm25_top_k: int = 10
+    dense_top_k: int = 10
+    rrf_k: int = 60                      # standard RRF constant
+    diversity_max_per_url: int = 2
+
+    # Reranking
+    # RAGStrategy overrides this when calling llm.generate(), 
+    # so the LLM config default no longer matters.
+    answer_max_new_tokens: int = 128
+
+    # Reranking
+    final_top_k: int = 5
+
+
+# ===============================================================================
+# PROMPT
+# ===============================================================================
+
+_RAG_EXPANSION_PROMPT = """\
+Generate {n} alternative search queries for the question below.
+Rules: each must be semantically distinct, under 12 words, no numbering.
+Output ONLY the queries, one per line.
+
+Question: {query}"""
+
+# Use <<<EVIDENCE>>>, <<<QUESTION>>>, <<<OPTIONS>>> as delimiters
+# instead of {evidence}/{question}/{options} with str.format(), which raises
+# KeyError if any option text or evidence chunk contains literal braces { }.
+_RAG_ANSWER_PROMPT = """\
+Answer this multiple-choice question using the evidence below.
+Return ONLY a JSON object with keys: option_id, confidence, reason.
+
+Evidence:
+<<<EVIDENCE>>>
+
+Question: <<<QUESTION>>>
+<<<OPTIONS>>>"""
+
+
+def build_rag_prompt(question: Question, evidence: str) -> str:
+    options = "\n".join(f"{o.id}) {o.text}" for o in question.options)
+    return (
+        _RAG_ANSWER_PROMPT
+        .replace("<<<EVIDENCE>>>", evidence)
+        .replace("<<<QUESTION>>>", question.text)
+        .replace("<<<OPTIONS>>>", options)
+    )
+
+
+# ===============================================================================
+# QUERY EXPANSION  — uses the same LocalLLM passed to the strategy
+# ===============================================================================
+
+
+def _expand_query_rag(query: str, cfg: RAGConfig, llm: LocalLLM) -> list[str]:
+    if cfg.num_extra_queries == 0:
+        return [query]
+    # Same brace-safety fix for the expansion prompt
+    prompt = (
+        _RAG_EXPANSION_PROMPT
+        .replace("{n}", str(cfg.num_extra_queries))
+        .replace("{query}", query)
+    )
+    try:
+        raw = llm.generate(prompt, max_new_tokens=80, do_sample=False)
+        variants = [
+            line.strip()
+            for line in raw.strip().splitlines()
+            if line.strip() and line.strip().lower() != query.lower()
+        ][: cfg.num_extra_queries]
+    except Exception as exc:
+        _rag_log.warning("RAG query expansion failed: %s", exc)
+        variants = []
+    all_queries = [query] + variants
+    _rag_log.info("RAG expanded queries: %s", all_queries)
+    return all_queries
+
+
+# ===============================================================================
+# SEARCH
+# ===============================================================================
+
+
+def _rag_search_all(queries: list[str], cfg: RAGConfig) -> list[dict]:
+    seen: set[str] = set()
+    merged: list[dict] = []
+    for q in queries:
+        try:
+            with DDGS(timeout=cfg.timeout_ddg) as ddgs:
+                results = list(ddgs.text(q, max_results=cfg.max_ddg_results))
+        except Exception as exc:
+            _rag_log.warning("RAG DDG search failed for %r: %s", q, exc)
+            continue
+        for r in results:
+            url = (r.get("href") or "").strip().lower().rstrip("/")
+            if url and url not in seen:
+                seen.add(url)
+                merged.append(r)
+    _rag_log.info("RAG: %d unique URLs after search", len(merged))
+    return merged
+
+
+# ===============================================================================
+# ASYNC FETCHING
+# ===============================================================================
+
+_RAG_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RAGBot/1.0)"}
+_RAG_BLOCKED_EXTENSIONS = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
+_RAG_BLOCKED_DOMAINS = {
+    "twitter.com", "x.com", "instagram.com",
+    "facebook.com", "tiktok.com", "reddit.com",
+}
+
+
+def _rag_is_fetchable(url: str) -> bool:
+    from urllib.parse import urlparse
+    parsed = urlparse(url.lower())
+    if any(parsed.netloc.endswith(d) for d in _RAG_BLOCKED_DOMAINS):
+        return False
+    if any(parsed.path.endswith(ext) for ext in _RAG_BLOCKED_EXTENSIONS):
+        return False
+    return True
+
+
+def _rag_extract_text(html: str) -> str:
+    text = trafilatura.extract(html, include_comments=False, include_tables=False, favor_recall=True)
+    if text and len(text) >= 200:
+        return text
+    if HAS_NEWSPAPER:
+        try:
+            article = NewspaperArticle(url="")
+            article.set_html(html)
+            article.parse()
+            if article.text and len(article.text) >= 200:
+                return article.text
+        except Exception:
+            pass
+    return ""
+
+
+async def _rag_fetch_one(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    result: dict,
+    cfg: RAGConfig,
+) -> list[Document]:
+    url: str = result.get("href", "")
+    title: str = result.get("title", "No title")
+    snippet: str = result.get("body", "")
+
+    def _snippet_doc() -> list[Document]:
+        return (
+            [Document(page_content=snippet, metadata={"title": title, "url": url, "snippet": snippet, "chunk_id": 0})]
+            if snippet else []
+        )
+
+    if not url or not _rag_is_fetchable(url):
+        return _snippet_doc()
+
+    async with semaphore:
+        try:
+            resp = await client.get(url, headers=_RAG_HEADERS, timeout=cfg.fetch_timeout)
+            resp.raise_for_status()
+            html = resp.text
+        except Exception as exc:
+            _rag_log.debug("RAG fetch failed for %s: %s", url, exc)
+            return _snippet_doc()
+
+    text = _rag_extract_text(html) or snippet
+    text = " ".join(text.split())[: cfg.max_text_chars]
+    chunks = _RAG_SPLITTER.split_text(text)
+    return [
+        Document(page_content=chunk, metadata={"title": title, "url": url, "snippet": snippet, "chunk_id": i})
+        for i, chunk in enumerate(chunks)
+    ]
+
+
+async def _rag_fetch_all_async(results: list[dict], cfg: RAGConfig) -> list[Document]:
+    semaphore = asyncio.Semaphore(cfg.max_concurrent_fetches)
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        tasks = [asyncio.ensure_future(_rag_fetch_one(client, semaphore, r, cfg)) for r in results]
+        done, pending = await asyncio.wait(tasks, timeout=cfg.total_fetch_budget)
+        if pending:
+            _rag_log.info("RAG: cancelling %d slow fetches (budget %.1fs exceeded)", len(pending), cfg.total_fetch_budget)
+            for t in pending:
+                t.cancel()
+
+    docs: list[Document] = []
+    for fut in done:
+        try:
+            batch = fut.result()
+            if not isinstance(batch, Exception):
+                docs.extend(batch)
+        except Exception as exc:
+            _rag_log.debug("RAG fetch task raised: %s", exc)
+
+    _rag_log.info("RAG: %d chunks after fetch", len(docs))
+    return docs
+
+
+def _rag_fetch_all(results: list[dict], cfg: RAGConfig) -> list[Document]:
+    """
+    Sync entry-point — compatible with both Jupyter and plain scripts.
+    Same brace-safety fix for the expansion prompt
+    """
+    try:
+        loop = asyncio.get_running_loop()       # raises RuntimeError if not running
+        return loop.run_until_complete(_rag_fetch_all_async(results, cfg))   # Jupyter path
+    except RuntimeError:
+        return asyncio.run(_rag_fetch_all_async(results, cfg))               # script path
+
+
+# ===============================================================================
+# HYBRID RETRIEVAL: BM25 + DENSE + RRF
+# ===============================================================================
+
+
+def _rag_dense_retrieve(query: str, docs: list[Document], top_k: int) -> list[Document]:
+    """Bi-encoder retrieval using the module-level SentenceTransformer (on-device, no network)."""
+    if not docs:
+        return []
+    texts = [d.page_content for d in docs]
+    doc_embs = _RAG_EMBED_MODEL.encode(texts, batch_size=64, normalize_embeddings=True, show_progress_bar=False)
+    q_emb = _RAG_EMBED_MODEL.encode(query, normalize_embeddings=True)
+    scores = np.dot(doc_embs, q_emb)
+    top_idx = np.argsort(scores)[::-1][:top_k]
+    return [docs[i] for i in top_idx]
+
+
+def _rag_rrf_fuse(ranked_lists: list[list[Document]], cfg: RAGConfig) -> list[Document]:
+    """Reciprocal Rank Fusion — parameter-free merging of multiple ranked lists."""
+    scores: dict[str, float] = {}
+    doc_map: dict[str, Document] = {}
+    for ranked in ranked_lists:
+        for rank, doc in enumerate(ranked):
+            key = "{}::{}".format(
+                doc.metadata.get("url", ""),
+                doc.metadata.get("chunk_id", hashlib.md5(doc.page_content.encode()).hexdigest()[:8]),
+            )
+            scores[key] = scores.get(key, 0.0) + 1.0 / (cfg.rrf_k + rank)
+            doc_map[key] = doc
+    ranked_keys = sorted(scores, key=scores.__getitem__, reverse=True)
+    fused = []
+    for key in ranked_keys:
+        doc = doc_map[key]
+        doc.metadata["rrf_score"] = scores[key]
+        fused.append(doc)
+    _rag_log.info("RAG RRF: merged -> %d docs", len(fused))
+    return fused
+
+
+def _rag_hybrid_retrieve(query: str, docs: list[Document], cfg: RAGConfig) -> list[Document]:
+    bm25 = BM25Retriever.from_documents(docs, k=cfg.bm25_top_k)
+    bm25_results = bm25.invoke(query)
+    dense_results = _rag_dense_retrieve(query, docs, cfg.dense_top_k)
+    return _rag_rrf_fuse([bm25_results, dense_results], cfg)
+
+
+# ===============================================================================
+# DIVERSITY FILTER + CROSS-ENCODER RERANK
+# ===============================================================================
+
+
+def _rag_diversity_filter(docs: list[Document], max_per_url: int) -> list[Document]:
+    seen: dict[str, int] = {}
+    filtered = []
+    for doc in docs:
+        url = doc.metadata.get("url", "")
+        if seen.get(url, 0) >= max_per_url:
+            continue
+        filtered.append(doc)
+        seen[url] = seen.get(url, 0) + 1
+    return filtered
+
+
+def _rag_cross_encode_rerank(query: str, docs: list[Document], cfg: RAGConfig) -> list[Document]:
+    if not docs:
+        return docs
+    pairs = [(query, d.page_content) for d in docs]
+    try:
+        scores = _RAG_CROSS_ENCODER.predict(pairs)
+    except Exception as exc:
+        _rag_log.warning("RAG cross-encoder failed: %s", exc)
+        return docs[: cfg.final_top_k]
+    ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in ranked[: cfg.final_top_k]]
+
+
+# ===============================================================================
+# FORMAT
+# ===============================================================================
+
+
+def _rag_format_evidence(docs: list[Document]) -> str:
+    if not docs:
+        return "No evidence found."
+    blocks = []
+    for i, doc in enumerate(docs, 1):
+        blocks.append(
+            f"[{i}] {doc.metadata.get('title', 'N/A')}\n"
+            f"URL: {doc.metadata.get('url', 'N/A')}\n"
+            f"{doc.page_content}"
+        )
+    return "\n\n".join(blocks)
+
+
+# ===============================================================================
+# PIPELINE (internal, called by RAGStrategy)
+# ===============================================================================
+
+
+def _rag_retrieve(query: str, cfg: RAGConfig, llm: LocalLLM) -> str:
+    t0 = time.perf_counter()
+
+    # 1. Query expansion using the local LLM
+    queries = _expand_query_rag(query, cfg, llm)
+
+    # 2. Web search across all variants
+    raw_results = _rag_search_all(queries, cfg)
+    if not raw_results:
+        return "No results found."
+
+    # 3. Parallel async fetch with hard time budget
+    docs = _rag_fetch_all(raw_results, cfg)
+    if not docs:
+        return "No results found."
+
+    # 4. Hybrid BM25 + dense + RRF fusion
+    fused_docs = _rag_hybrid_retrieve(query, docs, cfg)
+
+    # 5. Diversity filter BEFORE cross-encoder so final_top_k slots stay diverse
+    diverse_docs = _rag_diversity_filter(fused_docs, cfg.diversity_max_per_url)
+
+    # 6. Cross-encoder rerank on the diverse candidate set
+    top_docs = _rag_cross_encode_rerank(query, diverse_docs, cfg)
+
+    _rag_log.info("RAG retrieve() done in %.2fs → %d chunks", time.perf_counter() - t0, len(top_docs))
+    return _rag_format_evidence(top_docs)
+
+
+# ===============================================================================
+# STRATEGY
+# ===============================================================================
+
+
+class RAGStrategy(BaseStrategy):
+    """
+    Retrieval-Augmented Generation strategy.
+
+    Plugs into the existing LocalLLM interface (GemmaLLM / QwenLLM).
+    The same LLM is used for optional query expansion and for the final answer.
+
+    Usage
+    -----
+        strategy = RAGStrategy(llm=GemmaLLM())
+        prediction = strategy.answer(question)
+
+        # Custom retrieval config:
+        cfg = RAGConfig(num_extra_queries=0, final_top_k=3)
+        strategy = RAGStrategy(llm=QwenLLM(), retrieval_config=cfg)
+    """
+
+    name = "rag"
+    _log = _rag_log
+
+    def __init__(
+        self,
+        llm: LocalLLM,
+        retrieval_config: RAGConfig | None = None,
+        fallback_strategy: BaseStrategy | None = None,
+    ):
+        self.llm = llm
+        self.cfg = retrieval_config or RAGConfig()
+        self.fallback = fallback_strategy or HeuristicStrategy()
+
+    def answer(self, question: Question) -> AnswerPrediction:
+        try:
+            evidence = _rag_retrieve(question.text, self.cfg, self.llm)
+            prompt = build_rag_prompt(question, evidence)
+            # Override max_new_tokens here instead of relying on the LLM config default
+            raw_text = self.llm.generate(prompt, max_new_tokens=self.cfg.answer_max_new_tokens)
+            prediction = parse_answer_prediction(raw_text, question, strategy_name=self.name)
+            prediction.metadata.update({
+                "strategy": self.name,
+                "model_name": getattr(self.llm, "model_name", "unknown"),
+                "device": getattr(self.llm, "device_summary", "unknown"),
+                "num_evidence_chunks": self.cfg.final_top_k,
+            })
+            return prediction
+
+        except Exception as exc:
+            self._log.warning("RAGStrategy error, using fallback: %s", exc)
+            fallback_pred = self.fallback.answer(question)
+            fallback_pred.metadata["fallback"] = True
+            fallback_pred.metadata["fallback_reason"] = str(exc)
             return fallback_pred
