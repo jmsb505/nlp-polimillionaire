@@ -866,7 +866,7 @@ def _words(text: str) -> list[str]:
     return re.findall(r"[A-Za-z0-9]+", text.lower())
 
 
-@@tool
+@tool
 def web_search_tool(query: str) -> str:
     """
     Tool for modern pop culture, movies, music, recent events (up to current year 2026), 
