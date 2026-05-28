@@ -187,7 +187,6 @@ class GemmaLLM:
         from langchain_core.outputs import ChatResult, ChatGeneration
         from langchain_core.messages import BaseMessage
         
-    
         if hasattr(input_data, "to_string"):
             prompt_text = input_data.to_string()
         elif isinstance(input_data, list) and len(input_data) > 0:
@@ -195,20 +194,11 @@ class GemmaLLM:
         else:
             prompt_text = str(input_data)
             
+
         generated_text = self.generate(prompt_text)
+
+        return str(generated_text)
         
-    
-        class CustomContent:
-            def __init__(self, text):
-                self.content = [{'text': text}]
-                self.text_content = text
-            @property
-            def str_output(self):
-                return self.text_content
-            def __str__(self):
-                return self.text_content
-                g
-        return CustomContent(generated_text)
 
     def _load(self) -> None:
         if self.is_loaded:
@@ -358,11 +348,9 @@ class QwenLLM:
         return self._processor.decode(generated_ids, skip_special_tokens=True).strip()
     
     def invoke(self, input_data: Any, config: Any = None) -> Any:
-    
         from langchain_core.outputs import ChatResult, ChatGeneration
         from langchain_core.messages import BaseMessage
         
-    
         if hasattr(input_data, "to_string"):
             prompt_text = input_data.to_string()
         elif isinstance(input_data, list) and len(input_data) > 0:
@@ -370,19 +358,10 @@ class QwenLLM:
         else:
             prompt_text = str(input_data)
             
+
         generated_text = self.generate(prompt_text)
-        
-        class CustomContent:
-            def __init__(self, text):
-                self.content = [{'text': text}]
-                self.text_content = text
-            @property
-            def str_output(self):
-                return self.text_content
-            def __str__(self):
-                return self.text_content
-                g
-        return CustomContent(generated_text)
+
+        return str(generated_text)
 
     def _load(self) -> None:
         if self.is_loaded:
@@ -887,6 +866,35 @@ def _words(text: str) -> list[str]:
     return re.findall(r"[A-Za-z0-9]+", text.lower())
 
 
+@@tool
+def web_search_tool(query: str) -> str:
+    """
+    Tool for modern pop culture, movies, music, recent events (up to current year 2026), 
+    awards, or current news. Input must be a short, concise web search query string.
+    """
+    import urllib.request
+    import urllib.parse
+    import json
+    try:
+        clean_query = urllib.parse.quote(query.strip())
+        url = f"https://api.duckduckgo.com/?q={clean_query}&format=json&no_html=1&skip_disambig=1"
+        
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=4) as response:
+            data = json.loads(response.read().decode())
+            
+        abstract = data.get("AbstractText", "")
+        if abstract:
+            return f"Web Search Context: {abstract}"
+            
+        related = data.get("RelatedTopics", [])
+        if related and "Text" in related[0]:
+            return f"Web Search Context: {related[0]['Text']}"
+            
+        return "No direct web results found. Try simplifying the query."
+    except Exception as e:
+        return f"Web search failed: {str(e)}"
+
 @tool
 def calculator_tool(expression: str) -> float:
     """
@@ -900,13 +908,13 @@ def calculator_tool(expression: str) -> float:
 def wikipedia_tool(search_term: str) -> str:
     """
     Historical facts, biographies or general knowledge, this tool finds.
-    A single entity or concept as search_term string, it requires.
+    A single entity, historical person, or academic concept as search_term string, it requires.
     """
+    import urllib.request
+    import urllib.parse
+    import json
+    from bs4 import BeautifulSoup
     try:
-        import urllib.request
-        import urllib.parse
-        from bs4 import BeautifulSoup
-        
         query = urllib.parse.quote(search_term.strip())
         url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={query}&format=json"
         req = urllib.request.Request(url, headers={'User-Agent': 'PoliMillionaireAgent/1.0'})
@@ -932,10 +940,11 @@ class LangChainAgenticStrategy(BaseStrategy):
         # Wraps your existing LocalLLM (Gemma/Qwen) into a LangChain compatible interface
         self.raw_llm = raw_llm
         self.fallback = fallback_strategy or HeuristicStrategy()
-        self.tools = [calculator_tool, wikipedia_tool]
+        self.tools = [calculator_tool, wikipedia_tool, web_search_tool]
         self._setup_agent_prompts()
 
     def _setup_agent_prompts(self):
+        # Renderizamos las descripciones dinámicamente incluyendo DuckDuckGo
         rendered_tools = render_text_description(self.tools)
         
         system_routing = f"""
@@ -945,12 +954,14 @@ Your job is to decide if you need an external tool to answer the question accura
 Here are the names and descriptions for each tool available:
 {rendered_tools}
 
-Given the question, you must return a JSON blob with 'name' and 'arguments' keys.
-If you DO NOT need a tool to answer the question, you MUST set 'name': "none" and 'arguments': {{"query": ""}}.
-If you need a tool, choose one from the list.
+STRICT SELECTION CRITERIA:
+1. If the question requires math, counting, formulas, or arithmetic operations, you MUST choose 'calculator_tool'.
+2. If the question is about established history, global geography, science, or older biographies, you MUST choose 'wikipedia_tool'.
+3. If the question is about modern pop culture, movies, actors, music, awards, current news, or events up to the current year 2026, you MUST choose 'web_search_tool'.
+4. If you DO NOT need a tool to answer the question, you MUST set 'name': "none" and 'arguments': {{"query": ""}}.
 
 The response format MUST be exactly a valid JSON block like this:
-{{"name": "tool_name", "arguments": {{"expression": "2+2"}}}}
+{{"name": "tool_name", "arguments": {{"query": "search query text here"}}}}
 """
         self.routing_prompt = ChatPromptTemplate.from_messages([
             ("system", system_routing),
@@ -970,6 +981,8 @@ You MUST return your response ONLY as a JSON blob matching this structure:
             ("user", "Question: {{input}}\nOptions:\n{{options_text}}")
         ], template_format="jinja2")
 
+    
+
     def _invoke_tool(self, tool_name: str, tool_args: dict) -> str:
         if tool_name == "none" or not tool_name:
             return "No additional context needed."
@@ -977,7 +990,24 @@ You MUST return your response ONLY as a JSON blob matching this structure:
         tool_map = {t.name: t for t in self.tools}
         if tool_name in tool_map:
             try:
-                result = tool_map[tool_name].invoke(tool_args)
+                actual_args = tool_args
+                if tool_name in ["wikipedia_tool", "web_search_tool"]:
+                    extracted_text = tool_args.get("query") or tool_args.get("search_term") or tool_args.get("expression")
+                    if not extracted_text and isinstance(tool_args, dict) and tool_args:
+                        extracted_text = list(tool_args.values())[0]
+                    
+                    if tool_name == "wikipedia_tool":
+                        actual_args = {"search_term": str(extracted_text or "")}
+                    else:
+                        actual_args = {"query": str(extracted_text or "")}
+                        
+                elif tool_name == "calculator_tool":
+                    extracted_expr = tool_args.get("expression") or tool_args.get("query")
+                    if not extracted_expr and isinstance(tool_args, dict) and tool_args:
+                        extracted_expr = list(tool_args.values())[0]
+                    actual_args = {"expression": str(extracted_expr or "2+2")}
+
+                result = tool_map[tool_name].invoke(actual_args)
                 return str(result)
             except Exception as e:
                 return f"Tool execution failed: {str(e)}"
@@ -985,54 +1015,116 @@ You MUST return your response ONLY as a JSON blob matching this structure:
 
     def answer(self, question: Question) -> AnswerPrediction:
         try:
+            import traceback  # <-- Para ver la línea exacta del error
             options_str = "\n".join([f"ID {o.id}: {o.text}" for o in question.options])
             
             # --- PHASE 1: TOOL ROUTING ---
-            # Use LangChain pipe syntax to call the local wrapper model
-            routing_chain = self.routing_prompt | self.raw_llm | JsonOutputParser()
+            formatted_routing_prompt = self.routing_prompt.format(
+                input=question.text,
+                options_text=options_str
+            )
             
-            routing_res = routing_chain.invoke({
-                "input": question.text,
-                "options_text": options_str
-            })
+            if hasattr(self.raw_llm, 'generate'):
+                routing_output = self.raw_llm.generate(formatted_routing_prompt, max_new_tokens=512, max_time=30.0)
+            else:
+                routing_output = self.raw_llm.invoke(formatted_routing_prompt)
             
-            tool_name = routing_res.get("name", "none")
-            tool_arguments = routing_res.get("arguments", {})
+            routing_text = getattr(routing_output, "text_content", str(routing_output))
+            
+            print(f"[AGENT DEBUG] Phase 1: Routing raw output: ---\n{routing_text}\n-------------------------------------------------")
+            
+            try:
+                match_routing = re.search(r'\{.*\}', routing_text, re.DOTALL)
+                if match_routing:
+                    routing_json = json.loads(match_routing.group(0))
+                    tool_name = routing_json.get("name", "none")
+                    tool_arguments = routing_json.get("arguments", {})
+            except Exception as json_err:
+                print(f"[AGENT DEBUG] Error parsing tools JSON. {json_err}")
             
             # --- PHASE 2: TOOL EXECUTION ---
             context_data = self._invoke_tool(tool_name, tool_arguments)
+            print(f"[Agent Debug] Phase 2: Chosen Tool [{tool_name}] | Retrieved context: {context_data[:100]}...")
             
             # --- PHASE 3: FINAL ANSWER GENERATION ---
-            answer_chain = self.answer_prompt | self.raw_llm | JsonOutputParser()
-            final_res = answer_chain.invoke({
-                "context": context_data,
-                "input": question.text,
-                "options_text": options_str
-            })
+            formatted_answer_prompt = self.answer_prompt.format(
+                context=context_data,
+                input=question.text,
+                options_text=options_str
+            )
             
-            selected_id = int(final_res["option_id"])
-            chosen_option = next((o for o in question.options if o.id == selected_id), question.options[0])
+            if hasattr(self.raw_llm, 'generate'):
+                final_output = self.raw_llm.generate(formatted_answer_prompt, max_new_tokens=512, max_time=30.0)
+            else:
+                final_output = self.raw_llm.invoke(formatted_answer_prompt)
+                
+            final_text = getattr(final_output, "text_content", str(final_output))
             
-            return AnswerPrediction(
-                option_id=chosen_option.id,
-                answer_text=chosen_option.text,
-                confidence=float(final_res.get("confidence", 0.7)),
-                reasoning=str(final_res.get("reasoning", "Decided using LangChain Agent pipeline.")),
-                metadata={
+            # 🔍 [DEBUG 3]: Ver qué responde el modelo como respuesta final antes del parseo
+            print(f"[DEBUG AGENTE] Phase 3: Final raw output ---\n{final_text}\n-------------------------------------------------")
+            
+            # --- PHASE 4: ULTRA-ROBUST PARSING ---
+            prediction_data = self._robust_parse_final_answer(final_text, question)
+            if prediction_data:
+                prediction_data.metadata.update({
                     "strategy": self.name,
                     "used_tool": tool_name,
                     "tool_arguments": str(tool_arguments),
-                    "tool_output": context_data
-                }
-            )
-            
+                    "tool_output": context_data,
+                    "fallback": False
+                })
+                return prediction_data
+            else:
+                print("❌ [Agent Debug] Phase 4: '_robust_parse_final_answer' returned none. The text does not contain any processable format.")
+                
         except Exception as e:
-            print(f"[LangChainAgent] Error captured, deploying fallback: {str(e)}")
-            fallback_pred = self.fallback.answer(question)
-            fallback_pred.metadata["fallback"] = True
-            fallback_pred.metadata["fallback_reason"] = str(e)
-            return fallback_pred
+            print(f"[AGENT DEBUG] Internal crash in strategy")
+            traceback.print_exc()
+            
+        fallback_pred = self.fallback.answer(question)
+        fallback_pred.metadata["fallback"] = True
+        fallback_pred.metadata["fallback_reason"] = "Pipeline exception occurred"
+        return fallback_pred
 
+    def _robust_parse_final_answer(self, text: str, question: Question) -> AnswerPrediction | None:
+        # Regex to locate any JSON block inside the model output, we deploy!
+        try:
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if match:
+                clean_json_str = match.group(0)
+                data = json.loads(clean_json_str)
+                
+                # Extract the option ID defensively
+                raw_id = data.get("option_id")
+                if raw_id is not None:
+                    selected_id = int(raw_id)
+                    chosen_option = next((o for o in question.options if o.id == selected_id), question.options[0])
+                    
+                    return AnswerPrediction(
+                        option_id=chosen_option.id,
+                        answer_text=chosen_option.text,
+                        confidence=float(data.get("confidence", 0.85)),
+                        reasoning=str(data.get("reasoning", "Parsed via robust JSON engine.")),
+                        metadata={}
+                    )
+        except Exception as parse_exc:
+            print(f"[{self.name}] Regex JSON parser missed, fallback to heuristic extraction: {parse_exc}")
+
+        # Emergency Fallback: If JSON is completely corrupted, search for integers in text
+        for token in text.split():
+            clean_token = re.sub(r'[^0-9]', '', token)
+            if clean_token.isdigit():
+                val = int(clean_token)
+                for opt in question.options:
+                    if opt.id == val:
+                        return AnswerPrediction(
+                            option_id=opt.id,
+                            answer_text=opt.text,
+                            confidence=0.5,
+                            reasoning=f"Extracted direct integer reference '{val}' from corrupted output.",
+                            metadata={}
+                        )
+        return None
 
 
 # ==============================================================================
