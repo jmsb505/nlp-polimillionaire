@@ -78,6 +78,15 @@ def test_qwen_strategy_accepts_thinking_config_without_loading_model():
     assert strategy.llm.is_loaded is False
 
 
+def test_qwen_generation_overrides_remove_sampling_kwargs_for_judge():
+    llm = QwenLLM(QwenLLMConfig(do_sample=True, temperature=0.8, top_p=0.9, top_k=20))
+    kwargs = llm._generation_kwargs({"do_sample": False})
+    assert kwargs["do_sample"] is False
+    assert "temperature" not in kwargs
+    assert "top_p" not in kwargs
+    assert "top_k" not in kwargs
+
+
 def test_quantized_model_loaders_pass_course_bitsandbytes_config(monkeypatch):
     calls = []
     fake_transformers = ModuleType("transformers")

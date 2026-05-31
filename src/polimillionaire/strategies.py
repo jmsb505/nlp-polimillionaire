@@ -3,15 +3,12 @@ from __future__ import annotations
 """Strategies, local model loading, prompting, and output parsing."""
 
 import json
+import math
 import random
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Protocol
-from langchain_core.tools import tool, render_text_description
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
-
 import asyncio
 import hashlib
 import time
@@ -71,16 +68,64 @@ class HeuristicStrategy(BaseStrategy):
         )
 
 
+class CalculatorStrategy(BaseStrategy):
+    name = "calculator"
+
+    def __init__(self, fallback_strategy: BaseStrategy | None = None):
+        self.fallback_strategy = fallback_strategy
+
+    def answer(self, question: Question) -> AnswerPrediction:
+        solved = _solve_math_question(question)
+        if solved is not None:
+            option, value, method = solved
+            return AnswerPrediction(
+                option_id=option.id,
+                answer_text=option.text,
+                confidence=1.0,
+                reasoning=f"Calculated value: {value}.",
+                metadata={
+                    "strategy": self.name,
+                    "fallback": False,
+                    "tool": "calculator",
+                    "calculated_value": value,
+                    "calculation_method": method,
+                },
+            )
+        if self.fallback_strategy is not None:
+            prediction = self.fallback_strategy.answer(question)
+            prediction.metadata["calculator_attempted"] = True
+            return prediction
+        option = question.first_option()
+        return AnswerPrediction(
+            option_id=option.id,
+            answer_text=option.text,
+            confidence=0.0,
+            reasoning="Could not calculate a matching option.",
+            metadata={"strategy": self.name, "fallback": True},
+        )
+
+
 def route_question(question: Question) -> RouteDecision:
+    question_lowered = question.text.lower()
     text = f"{question.text} " + " ".join(option.text for option in question.options)
     lowered = text.lower()
-    if _looks_like_math(lowered):
+    if _looks_recent_or_report(lowered):
+        return RouteDecision("rag", "recent_or_report")
+    if _looks_like_math(question_lowered):
         return RouteDecision("direct", "math")
-    if _has_negation_trap(lowered):
+    if _has_negation_trap(question_lowered):
         return RouteDecision("direct", "negation")
     if _looks_factual(lowered):
         return RouteDecision("rag", "factual")
     return RouteDecision("fallback", "general")
+
+
+def _retrieval_query(question: Question) -> str:
+    option_text = " ".join(option.text for option in question.options)
+    full_query = " ".join(f"{question.text} {option_text}".split())
+    if _looks_recent_or_report(full_query.lower()):
+        return full_query[:500]
+    return question.text
 
 
 class RoutedStrategy(BaseStrategy):
@@ -153,6 +198,24 @@ class FakeLLM:
         if len(self.responses) == 1:
             return self.responses[0]
         return self.responses.pop(0)
+
+
+class LocalLLMVariant:
+    def __init__(self, llm: LocalLLM, variant_name: str, **generation_overrides: Any):
+        self.llm = llm
+        self.model_name = variant_name
+        self.generation_overrides = {
+            key: value for key, value in generation_overrides.items() if value is not None
+        }
+
+    @property
+    def device_summary(self) -> str:
+        return getattr(self.llm, "device_summary", "unknown")
+
+    def generate(self, prompt: str, **kwargs: object) -> str:
+        merged = dict(kwargs)
+        merged.update(self.generation_overrides)
+        return self.llm.generate(prompt, **merged)
 
 
 @dataclass
@@ -230,6 +293,13 @@ class GemmaLLM:
         else:
             raise ValueError(f"Unsupported inference_backend: {self.config.inference_backend}")
         return text.strip()
+
+    def unload(self) -> None:
+        self._model = None
+        self._processor = None
+        self._tokenizer = None
+        self._pipeline = None
+        _clear_torch_memory()
     
     def invoke(self, input_data: Any, config: Any = None) -> Any:
         from langchain_core.outputs import ChatResult, ChatGeneration
@@ -394,6 +464,11 @@ class QwenLLM:
             output_ids = self._model.generate(**inputs, **generation_kwargs)
         generated_ids = output_ids[0][input_length:]
         return self._processor.decode(generated_ids, skip_special_tokens=True).strip()
+
+    def unload(self) -> None:
+        self._model = None
+        self._processor = None
+        _clear_torch_memory()
     
     def invoke(self, input_data: Any, config: Any = None) -> Any:
         from langchain_core.outputs import ChatResult, ChatGeneration
@@ -443,6 +518,10 @@ class QwenLLM:
         if self.config.generation_max_time_seconds is not None:
             kwargs["max_time"] = self.config.generation_max_time_seconds
         kwargs.update({key: value for key, value in overrides.items() if value is not None})
+        if not kwargs.get("do_sample", False):
+            kwargs.pop("temperature", None)
+            kwargs.pop("top_p", None)
+            kwargs.pop("top_k", None)
         return kwargs
 
     def _seed(self, seed: int | None) -> None:
@@ -643,6 +722,233 @@ class CouncilStrategy(BaseStrategy):
         }
 
 
+class RoutedRAGCouncilStrategy(BaseStrategy):
+    name = "routed_rag_council"
+
+    def __init__(
+        self,
+        candidate_llms: list[LocalLLM],
+        judge_llm: LocalLLM,
+        direct_strategy: BaseStrategy | None = None,
+        retrieval_config: RAGConfig | None = None,
+        retriever: Callable[[str, RAGConfig, LocalLLM], tuple[str, list[Any], float]] | None = None,
+        judge_scope: str = "candidate_only",
+        base_seed: int = 500,
+        candidate_temperature: float = 0.7,
+        candidate_top_p: float = 0.9,
+        candidate_max_new_tokens: int = 80,
+        judge_max_new_tokens: int = 12,
+        max_time_per_call: float | None = 8.0,
+        always_judge: bool = True,
+        unload_candidates_before_judge: bool = False,
+        unload_judge_before_candidates: bool = False,
+        candidate_styles: list[str] | None = None,
+    ):
+        if not candidate_llms:
+            raise ValueError("At least one candidate LLM is required")
+        if judge_scope not in {"candidate_only", "any_option"}:
+            raise ValueError("judge_scope must be 'candidate_only' or 'any_option'")
+        self.candidate_llms = list(candidate_llms)
+        self.judge_llm = judge_llm
+        self.direct_strategy = direct_strategy
+        self.cfg = retrieval_config or RAGConfig(num_extra_queries=0)
+        self.retriever = retriever or _rag_retrieve
+        self.judge_scope = judge_scope
+        self.base_seed = base_seed
+        self.candidate_temperature = candidate_temperature
+        self.candidate_top_p = candidate_top_p
+        self.candidate_max_new_tokens = candidate_max_new_tokens
+        self.judge_max_new_tokens = judge_max_new_tokens
+        self.max_time_per_call = max_time_per_call
+        self.always_judge = always_judge
+        self.unload_candidates_before_judge = unload_candidates_before_judge
+        self.unload_judge_before_candidates = unload_judge_before_candidates
+        self.candidate_styles = candidate_styles or []
+
+    def answer(self, question: Question) -> AnswerPrediction:
+        if self.unload_judge_before_candidates:
+            self._unload_judge_except_candidates()
+
+        decision = route_question(question)
+        if decision.reason == "math" and self.direct_strategy is not None:
+            prediction = self.direct_strategy.answer(question)
+            prediction.metadata["route"] = decision.route
+            prediction.metadata["route_reason"] = decision.reason
+            prediction.metadata["routed_to"] = getattr(self.direct_strategy, "name", "direct")
+            return prediction
+
+        evidence = ""
+        evidence_docs: list[Any] = []
+        retrieval_seconds = 0.0
+        retrieval_error: str | None = None
+        use_rag = decision.route == "rag"
+        retrieval_query = _retrieval_query(question) if use_rag else ""
+        if use_rag:
+            try:
+                evidence, evidence_docs, retrieval_seconds = self.retriever(
+                    retrieval_query,
+                    self.cfg,
+                    self.candidate_llms[0],
+                )
+            except Exception as exc:
+                retrieval_error = str(exc)
+                use_rag = False
+
+        votes = self._candidate_votes(question, evidence if use_rag else None)
+        evidence_vote = _evidence_verifier_vote(question, evidence) if use_rag else None
+        if evidence_vote is not None:
+            votes.append(evidence_vote)
+        if not votes:
+            if self.direct_strategy is not None:
+                prediction = self.direct_strategy.answer(question)
+                prediction.metadata["route"] = decision.route
+                prediction.metadata["route_reason"] = decision.reason
+                prediction.metadata["routed_to"] = getattr(self.direct_strategy, "name", "direct")
+                prediction.metadata["council_fallback_reason"] = "No valid candidate votes."
+                return prediction
+            return _council_fallback(question, "No valid candidate votes.", [])
+
+        supported_options = {vote.option_id for vote in votes}
+        authoritative_evidence = _authoritative_evidence_option(votes, evidence_vote)
+        if authoritative_evidence is not None:
+            option_id, evidence_reason = authoritative_evidence
+            result = _selected_vote_prediction(question, votes, option_id)
+            result.reasoning = "Strong retrieved evidence selected this answer."
+            result.metadata.update(self._metadata(votes, None, "evidence_verifier", decision, use_rag, evidence, evidence_docs, retrieval_seconds, retrieval_error, retrieval_query))
+            result.metadata["evidence_verifier_reason"] = evidence_reason
+            return result
+
+        filtered = _support_filtered_option(votes)
+        if filtered is not None:
+            option_id, filter_reason = filtered
+            result = _selected_vote_prediction(question, votes, option_id)
+            result.metadata.update(self._metadata(votes, None, "support_filter", decision, use_rag, evidence, evidence_docs, retrieval_seconds, retrieval_error, retrieval_query))
+            result.metadata["support_filter_reason"] = filter_reason
+            return result
+
+        majority_option = _majority_option(votes)
+        if (
+            majority_option is not None
+            and not self.always_judge
+            and (evidence_vote is None or majority_option == evidence_vote.option_id)
+        ):
+            result = _selected_vote_prediction(question, votes, majority_option)
+            result.metadata.update(self._metadata(votes, None, "majority_vote", decision, use_rag, evidence, evidence_docs, retrieval_seconds, retrieval_error, retrieval_query))
+            return result
+
+        if self.unload_candidates_before_judge:
+            self._unload_candidates_except_judge()
+
+        judge_raw_text = self.judge_llm.generate(
+            build_rag_council_judge_prompt(question, votes, evidence if use_rag else "", self.judge_scope),
+            max_new_tokens=self.judge_max_new_tokens,
+            do_sample=False,
+            seed=self.base_seed + len(votes),
+            **self._time_kwargs(),
+        )
+        judged = parse_answer_prediction(judge_raw_text, question, strategy_name=self.name)
+        if not judged.metadata["fallback"] and (
+            self.judge_scope == "any_option" or judged.option_id in supported_options
+        ):
+            judged.metadata.update(self._metadata(votes, judge_raw_text, "judge", decision, use_rag, evidence, evidence_docs, retrieval_seconds, retrieval_error, retrieval_query))
+            judged.metadata["judge_novel_choice"] = judged.option_id not in supported_options
+            return judged
+
+        result = _weighted_vote(question, votes)
+        result.metadata.update(self._metadata(votes, judge_raw_text, "weighted_vote", decision, use_rag, evidence, evidence_docs, retrieval_seconds, retrieval_error, retrieval_query))
+        result.metadata["judge_rejected"] = True
+        result.metadata["judge_option_id"] = None if judged.metadata["fallback"] else judged.option_id
+        return result
+
+    def _candidate_votes(self, question: Question, evidence: str | None) -> list[AnswerPrediction]:
+        votes: list[AnswerPrediction] = []
+        for index, llm in enumerate(self.candidate_llms):
+            style = self.candidate_styles[index] if index < len(self.candidate_styles) else "balanced"
+            prompt = build_rag_council_vote_prompt(question, evidence, style)
+            raw_text = llm.generate(
+                prompt,
+                max_new_tokens=self.candidate_max_new_tokens,
+                do_sample=True,
+                temperature=self.candidate_temperature,
+                top_p=self.candidate_top_p,
+                seed=self.base_seed + index,
+                **self._time_kwargs(),
+            )
+            vote = parse_answer_prediction(raw_text, question, strategy_name="routed_rag_council_vote")
+            if vote.metadata["fallback"]:
+                continue
+            vote.metadata["model_name"] = getattr(llm, "model_name", "unknown")
+            vote.metadata["sample_seed"] = self.base_seed + index
+            vote.metadata["candidate_style"] = style
+            votes.append(vote)
+        return votes
+
+    def _unload_candidates_except_judge(self) -> None:
+        judge_roots = {_llm_root_id(self.judge_llm)}
+        for llm in self.candidate_llms:
+            if _llm_root_id(llm) not in judge_roots:
+                unload_strategy(llm)
+
+    def _unload_judge_except_candidates(self) -> None:
+        candidate_roots = {_llm_root_id(llm) for llm in self.candidate_llms}
+        if _llm_root_id(self.judge_llm) not in candidate_roots:
+            unload_strategy(self.judge_llm)
+
+    def _time_kwargs(self) -> dict[str, float]:
+        if self.max_time_per_call is None:
+            return {}
+        return {"max_time": self.max_time_per_call}
+
+    def _metadata(
+        self,
+        votes: list[AnswerPrediction],
+        judge_raw_text: str | None,
+        method: str,
+        decision: RouteDecision,
+        used_rag: bool,
+        evidence: str,
+        evidence_docs: list[Any],
+        retrieval_seconds: float,
+        retrieval_error: str | None,
+        retrieval_query: str,
+    ) -> dict[str, Any]:
+        return {
+            "strategy": self.name,
+            "route": decision.route,
+            "route_reason": decision.reason,
+            "used_rag": used_rag,
+            "retrieval_query": retrieval_query,
+            "retrieval_seconds": round(retrieval_seconds, 2),
+            "retrieval_error": retrieval_error,
+            "num_evidence_chunks": len(evidence_docs),
+            "evidence_preview": evidence[:1200] if evidence else "",
+            "evidence_sources": _rag_evidence_sources(evidence_docs) if evidence_docs else [],
+            "decision_method": method,
+            "judge_scope": self.judge_scope,
+            "unload_candidates_before_judge": self.unload_candidates_before_judge,
+            "unload_judge_before_candidates": self.unload_judge_before_candidates,
+            "candidate_styles": self.candidate_styles,
+            "candidate_devices": [
+                getattr(llm, "device_summary", "unknown") for llm in self.candidate_llms
+            ],
+            "judge_device": getattr(self.judge_llm, "device_summary", "unknown"),
+            "judge_model_name": getattr(self.judge_llm, "model_name", "unknown"),
+            "votes": [
+                {
+                    "option_id": vote.option_id,
+                    "confidence": vote.confidence,
+                    "reasoning": vote.reasoning,
+                    "model_name": vote.metadata.get("model_name"),
+                    "sample_seed": vote.metadata.get("sample_seed"),
+                    "style": vote.metadata.get("candidate_style"),
+                    "raw_text": str(vote.metadata.get("raw_text", ""))[:300],
+                }
+                for vote in votes
+            ],
+            "judge_raw_text": judge_raw_text,
+        }
+
+
 def build_prompt(question: Question) -> str:
     options = "\n".join(f"{option.id}) {option.text}" for option in question.options)
     negation_note = (
@@ -717,6 +1023,77 @@ def build_judge_prompt(
     )
 
 
+def build_rag_council_judge_prompt(
+    question: Question,
+    votes: list[AnswerPrediction],
+    evidence: str,
+    judge_scope: str = "candidate_only",
+) -> str:
+    options = "\n".join(f"{option.id}) {option.text}" for option in question.options)
+    summaries = "\n".join(
+        f"candidate {index + 1}: option={vote.option_id}, confidence={vote.confidence}, reason={vote.reasoning or ''}"
+        for index, vote in enumerate(votes)
+    )
+    supported = ", ".join(str(option_id) for option_id in sorted({vote.option_id for vote in votes}))
+    scope_text = (
+        f"Choose only one proposed option id: {supported}."
+        if judge_scope == "candidate_only"
+        else "You may choose any listed option if the candidates missed it."
+    )
+    evidence_text = evidence[:1800] if evidence else "No retrieved evidence was used."
+    return "\n\n".join(
+        [
+            "You are the final judge for a multiple-choice quiz.",
+            scope_text,
+            "Use candidate agreement, confidence, short reasons, and evidence if it is relevant.",
+            "If options overlap, prefer the complete option explicitly supported by evidence over a shorter related title.",
+            "Do not choose a candidate whose own reason says the answer is not mentioned or unsupported.",
+            "Return exactly: option_id: <number>",
+            f"Question: {question.text}",
+            options,
+            "Retrieved evidence:",
+            evidence_text,
+            "Candidate answers:",
+            summaries,
+        ]
+    )
+
+
+def build_rag_council_vote_prompt(
+    question: Question,
+    evidence: str | None,
+    style: str = "balanced",
+) -> str:
+    options = "\n".join(f"{option.id}) {option.text}" for option in question.options)
+    evidence_text = evidence[:1000] if evidence else "No retrieved evidence. Use your knowledge, but lower confidence if uncertain."
+    style_instructions = {
+        "evidence_checker": (
+            "Role: evidence checker. Use retrieved evidence when relevant. "
+            "Prefer the exact complete option fully supported by evidence. "
+            "When option texts overlap, do not pick a shorter related title unless the evidence supports that shorter title exactly. "
+            "If evidence is weak or unrelated, lower confidence."
+        ),
+        "option_eliminator": (
+            "Role: option eliminator. Compare every option against the question. "
+            "Reject distractors, watch NOT/EXCEPT wording, overlapping names, dates, exact title length, and causal direction."
+        ),
+        "balanced": (
+            "Role: balanced solver. Combine evidence, question wording, and basic background knowledge."
+        ),
+    }
+    instruction = style_instructions.get(style, style_instructions["balanced"])
+    return "\n\n".join(
+        [
+            instruction,
+            "Return ONLY JSON: {\"option_id\": <number>, \"confidence\": <0-1>, \"reason\": \"short\"}",
+            "Evidence:",
+            evidence_text,
+            f"Question: {question.text}",
+            options,
+        ]
+    )
+
+
 def parse_answer_prediction(raw_text: str, question: Question, strategy_name: str = "llm") -> AnswerPrediction:
     payload = _parse_payload(raw_text)
     option_id = _coerce_int(payload.get("option_id"))
@@ -752,6 +1129,85 @@ def _majority_option(votes: list[AnswerPrediction]) -> int | None:
         counts[vote.option_id] = counts.get(vote.option_id, 0) + 1
     option_id, count = max(counts.items(), key=lambda item: (item[1], -item[0]))
     return option_id if count > len(votes) / 2 else None
+
+
+def _support_filtered_option(votes: list[AnswerPrediction]) -> tuple[int, str] | None:
+    if len(votes) < 2:
+        return None
+    scored = sorted(
+        ((vote, _vote_support_score(vote)) for vote in votes),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    best, best_score = scored[0]
+    second_score = scored[1][1]
+    if best_score >= 0.35 and best_score - second_score >= 0.35:
+        return best.option_id, "clearer supported candidate"
+    supported = [vote for vote, score in scored if score >= 0.35 and not _vote_says_unsupported(vote)]
+    if supported and len({vote.option_id for vote in supported}) == 1:
+        return supported[0].option_id, "only supported candidate option"
+    return None
+
+
+def _authoritative_evidence_option(
+    votes: list[AnswerPrediction],
+    evidence_vote: AnswerPrediction | None,
+) -> tuple[int, str] | None:
+    if evidence_vote is None or evidence_vote.confidence is None or evidence_vote.confidence < 0.85:
+        return None
+    scores = evidence_vote.metadata.get("evidence_scores", {})
+    if not isinstance(scores, dict):
+        return None
+    best_score = float(scores.get(evidence_vote.option_id, 0.0))
+    other_score = max(
+        (float(score) for option_id, score in scores.items() if option_id != evidence_vote.option_id),
+        default=0.0,
+    )
+    if best_score < 3.0 or best_score - other_score < 2.0:
+        return None
+    opposing = [
+        vote for vote in votes
+        if vote is not evidence_vote and vote.option_id != evidence_vote.option_id
+    ]
+    strong_opposing = [vote for vote in opposing if _model_vote_is_well_supported(vote)]
+    if len(strong_opposing) >= 2:
+        return None
+    return evidence_vote.option_id, "strong evidence margin from retrieved sources"
+
+
+def _model_vote_is_well_supported(vote: AnswerPrediction) -> bool:
+    if vote.confidence is None or vote.confidence < 0.85:
+        return False
+    if _vote_says_unsupported(vote):
+        return False
+    reason = (vote.reasoning or "").strip()
+    if len(reason.split()) < 8:
+        return False
+    incomplete_endings = ("states", "explicitly states", "because", "while", "option")
+    return not reason.lower().rstrip(" .,:;").endswith(incomplete_endings)
+
+
+def _vote_support_score(vote: AnswerPrediction) -> float:
+    confidence = vote.confidence if vote.confidence is not None else 0.5
+    score = float(confidence)
+    if _vote_says_unsupported(vote):
+        score -= 0.6
+    return score
+
+
+def _vote_says_unsupported(vote: AnswerPrediction) -> bool:
+    text = f"{vote.reasoning or ''} {vote.metadata.get('raw_text', '')}".lower()
+    unsupported_patterns = [
+        "not mentioned",
+        "not supported",
+        "unsupported",
+        "no evidence",
+        "does not specify",
+        "doesn't specify",
+        "not in the text",
+        "unclear",
+    ]
+    return any(pattern in text for pattern in unsupported_patterns)
 
 
 def _selected_vote_prediction(
@@ -864,7 +1320,41 @@ def _match_option_text(raw_text: str, question: Question) -> int | None:
     for option in question.options:
         if option.text.lower() in lowered:
             return option.id
+    raw_tokens = set(_words(raw_text)) - _OPTION_STOPWORDS
+    best_option_id: int | None = None
+    best_score = 0.0
+    for option in question.options:
+        option_tokens = set(_words(option.text)) - _OPTION_STOPWORDS
+        if not option_tokens:
+            continue
+        overlap = raw_tokens & option_tokens
+        if len(overlap) < 2:
+            continue
+        score = len(overlap) / len(option_tokens)
+        if score > best_score:
+            best_score = score
+            best_option_id = option.id
+    if best_score >= 0.5:
+        return best_option_id
     return None
+
+
+_OPTION_STOPWORDS = {
+    "a",
+    "an",
+    "the",
+    "of",
+    "to",
+    "for",
+    "and",
+    "or",
+    "in",
+    "on",
+    "with",
+    "is",
+    "are",
+    "test",
+}
 
 
 def _tokenize_prompt(processor: Any, prompt: str) -> dict[str, Any]:
@@ -921,11 +1411,312 @@ def _quantization_kwargs(quantize_4bit: bool) -> dict[str, Any]:
     }
 
 
+def _solve_math_question(question: Question) -> tuple[Any, Any, str] | None:
+    text = question.text.replace("$", " ")
+    option = _statistics_test_option(question)
+    if option is not None:
+        return option, option.text, "statistics_test"
+    value = _sum_of_squares_value(text)
+    method = "sum_of_squares"
+    if value is None:
+        value = _linear_transformation_plane_value(text)
+        method = "linear_transformation"
+    if value is None:
+        value = _linear_interpolation_value(text)
+        method = "linear_interpolation"
+    if value is None:
+        value = _proportion_sample_size_value(text)
+        method = "proportion_sample_size"
+    if value is None:
+        value = _normal_iqr_value(text)
+        method = "normal_iqr"
+    if value is None:
+        value = _combination_value(text)
+        method = "combination"
+    if value is None:
+        value = _homomorphism_count_value(text)
+        method = "homomorphism_count"
+    if value is None:
+        value = _frequency_value(text)
+        method = "wave_frequency"
+    if value is None:
+        value = _arithmetic_value(text)
+        method = "arithmetic"
+    if value is None:
+        return None
+    option = _match_numeric_option(question, value)
+    if option is None:
+        return None
+    return option, value, method
+
+
+def _statistics_test_option(question: Question) -> Any | None:
+    lowered = question.text.lower()
+    if not any(token in lowered for token in ("significance test", "correct test", "t-test", "experiment")):
+        return None
+    paired_clues = (
+        "same volunteer",
+        "same subject",
+        "same person",
+        "one side",
+        "other side",
+        "before and after",
+        "difference in",
+        "paired",
+        "matched",
+    )
+    if any(clue in lowered for clue in paired_clues):
+        return _option_with_terms(question, {"matched", "pairs", "paired"})
+    two_sample_clues = ("two independent", "independent samples", "two groups")
+    if any(clue in lowered for clue in two_sample_clues):
+        return _option_with_terms(question, {"two", "sample", "t", "test"})
+    return None
+
+
+def _linear_transformation_plane_value(text: str) -> int | float | None:
+    lowered = text.lower()
+    if "linear transformation" not in lowered:
+        return None
+    pairs = re.findall(
+        r"f\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)\s*=\s*(-?\d+(?:\.\d+)?)",
+        lowered,
+    )
+    target = re.search(
+        r"then\s+f\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)",
+        lowered,
+    )
+    if len(pairs) < 2 or target is None:
+        return None
+    x1, y1, v1 = (float(value) for value in pairs[0])
+    x2, y2, v2 = (float(value) for value in pairs[1])
+    tx, ty = (float(value) for value in target.groups())
+    determinant = x1 * y2 - x2 * y1
+    if abs(determinant) < 1e-12:
+        return None
+    a = (v1 * y2 - v2 * y1) / determinant
+    b = (x1 * v2 - x2 * v1) / determinant
+    value = a * tx + b * ty
+    return int(round(value)) if abs(value - round(value)) < 1e-9 else value
+
+
+def _linear_interpolation_value(text: str) -> int | float | None:
+    lowered = text.lower()
+    if "linearly" not in lowered and "linear" not in lowered:
+        return None
+    pairs = re.findall(
+        r"(?:in|by)\s+(\d{4}).{0,80}?(?:there\s+(?:were|was)\s+)?([\d,]+)\s+(?:cases|reports|people|students|items)",
+        lowered,
+    )
+    if len(pairs) < 2:
+        return None
+    years = [int(year) for year in re.findall(r"\b(1[89]\d{2}|20\d{2})\b", lowered)]
+    known_years = {int(year) for year, _ in pairs[:2]}
+    target_years = [year for year in years if year not in known_years]
+    if not target_years:
+        return None
+    x1, y1 = int(pairs[0][0]), float(pairs[0][1].replace(",", ""))
+    x2, y2 = int(pairs[1][0]), float(pairs[1][1].replace(",", ""))
+    target = target_years[-1]
+    if x1 == x2:
+        return None
+    value = y1 + ((y2 - y1) / (x2 - x1)) * (target - x1)
+    return int(round(value)) if abs(value - round(value)) < 1e-6 else value
+
+
+def _proportion_sample_size_value(text: str) -> int | None:
+    lowered = text.lower()
+    if "sample size" not in lowered or "confidence interval" not in lowered:
+        return None
+    if "margin of error" not in lowered and "margin" not in lowered:
+        return None
+    percentages = [float(value) for value in re.findall(r"(\d+(?:\.\d+)?)\s*%", lowered)]
+    if not percentages:
+        return None
+    confidence = next((value for value in percentages if value in {90.0, 95.0, 99.0}), 95.0)
+    margin_candidates = [value for value in percentages if value < 50.0 and value != confidence]
+    if not margin_candidates:
+        return None
+    margin = min(margin_candidates) / 100.0
+    z_scores = {90.0: 1.645, 95.0: 1.96, 99.0: 2.576}
+    z = z_scores.get(confidence, 1.96)
+    if margin <= 0:
+        return None
+    return math.ceil((z * z * 0.25) / (margin * margin))
+
+
+def _normal_iqr_value(text: str) -> float | None:
+    lowered = text.lower()
+    if "normally distributed" not in lowered or "interquartile range" not in lowered:
+        return None
+    match = re.search(r"standard deviation(?:\s+of|\s+is)?\s+(\d+(?:\.\d+)?)", lowered)
+    if not match:
+        return None
+    return round(1.35 * float(match.group(1)), 2)
+
+
+def _option_with_terms(question: Question, terms: set[str]) -> Any | None:
+    best = None
+    best_score = 0
+    for option in question.options:
+        tokens = set(_words(option.text))
+        score = len(tokens & terms)
+        if score > best_score:
+            best = option
+            best_score = score
+    return best if best_score >= 2 else None
+
+
+def _combination_value(text: str) -> int | None:
+    patterns = [
+        r"\\d?binom\s*\{\s*(\d+)\s*\}\s*\{\s*(\d+)\s*\}",
+        r"\b[Cc]\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)",
+        r"\b(\d+)\s+choose\s+(\d+)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        n, k = int(match.group(1)), int(match.group(2))
+        if 0 <= k <= n:
+            return math.comb(n, k)
+    return None
+
+
+def _homomorphism_count_value(text: str) -> int | None:
+    lowered = text.lower().replace("\\mathbb", "")
+    match = re.search(r"homomorphisms?.*?\bz\b.*?\bz[_\s-]?(\d+)\b", lowered)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _frequency_value(text: str) -> float | None:
+    lowered = text.lower()
+    if "frequency" not in lowered or "wavelength" not in lowered or "speed" not in lowered:
+        return None
+    wavelength_match = re.search(r"wavelength\s+of\s+(\d+(?:\.\d+)?)\s*m\b", lowered)
+    speed_match = re.search(r"speed(?:\s+of\s+sound)?\s+is\s+(\d+(?:\.\d+)?)\s*m/s\b", lowered)
+    if not wavelength_match or not speed_match:
+        return None
+    wavelength = float(wavelength_match.group(1))
+    speed = float(speed_match.group(1))
+    if wavelength <= 0:
+        return None
+    value = speed / wavelength
+    return int(round(value)) if abs(value - round(value)) < 0.2 else value
+
+
+def _sum_of_squares_value(text: str) -> int | None:
+    lowered = text.lower()
+    if "^2" not in lowered or not any(token in lowered for token in ("cdots", "...", "…")):
+        return None
+    target = re.split(r"value of|calculate|what is", lowered, maxsplit=1)
+    segment = target[-1] if target else lowered
+    nums = [int(value) for value in re.findall(r"(\d+)\s*\^\s*2", segment)]
+    if len(nums) < 2:
+        return None
+    start, end = nums[0], nums[-1]
+    if start > end:
+        return None
+    return sum(number * number for number in range(start, end + 1))
+
+
+def _arithmetic_value(text: str) -> int | float | None:
+    text = re.sub(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b", " ", text)
+    matches = re.findall(r"(?<!\w)(\d+(?:\.\d+)?(?:\s*[\+\*/]\s*\d+(?:\.\d+)?)+)(?!\w)", text)
+    if not matches:
+        matches = re.findall(r"(?<!\w)(\d+(?:\.\d+)?\s+-\s+\d+(?:\.\d+)?)(?!\w)", text)
+    if not matches:
+        return None
+    expression = matches[-1]
+    try:
+        value = eval(expression, {"__builtins__": None}, {})
+    except Exception:
+        return None
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value if isinstance(value, (int, float)) else None
+
+
+def _match_numeric_option(question: Question, value: int | float) -> Any | None:
+    for option in question.options:
+        cleaned = option.text.replace(",", "")
+        numbers = re.findall(r"-?\d+(?:\.\d+)?", cleaned)
+        if not numbers:
+            continue
+        if any(abs(float(number) - float(value)) < 1e-6 for number in numbers):
+            return option
+    return None
+
+
+def _normalize_title(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _evidence_verifier_vote(question: Question, evidence: str) -> AnswerPrediction | None:
+    if not evidence or evidence == "No evidence found.":
+        return None
+    scored = _evidence_option_scores(question, evidence)
+    if not scored:
+        return None
+    ranked = sorted(scored.items(), key=lambda item: (item[1], len(question.require_option(item[0]).text)), reverse=True)
+    best_option_id, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+    if best_score < 3.0 or best_score - second_score < 2.0:
+        return None
+    option = question.require_option(best_option_id)
+    confidence = min(0.9, 0.55 + (best_score - second_score) / 10)
+    return AnswerPrediction(
+        option_id=option.id,
+        answer_text=option.text,
+        confidence=confidence,
+        reasoning="Retrieved evidence explicitly supports this option more than the alternatives.",
+        metadata={
+            "strategy": "evidence_verifier",
+            "fallback": False,
+            "model_name": "evidence_verifier",
+            "candidate_style": "evidence_verifier",
+            "evidence_scores": scored,
+        },
+    )
+
+
+def _evidence_option_scores(question: Question, evidence: str) -> dict[int, float]:
+    evidence_text = _normalize_title(evidence)
+    title_text = _normalize_title(" ".join(_evidence_titles(evidence)))
+    scores: dict[int, float] = {}
+    for option in question.options:
+        option_text = _normalize_title(option.text)
+        if not option_text:
+            continue
+        token_count = len(option_text.split())
+        text_hits = _phrase_hits(evidence_text, option_text)
+        title_hits = _phrase_hits(title_text, option_text)
+        if text_hits or title_hits:
+            token_weight = max(1.0, float(token_count))
+            scores[option.id] = text_hits * token_weight + title_hits * token_weight * 2.0
+    return scores
+
+
+def _evidence_titles(evidence: str) -> list[str]:
+    titles: list[str] = []
+    for line in evidence.splitlines():
+        match = re.match(r"\[\d+\]\s+(.+)", line.strip())
+        if match:
+            titles.append(match.group(1))
+    return titles
+
+
+def _phrase_hits(text: str, phrase: str) -> int:
+    return len(re.findall(rf"(?<!\w){re.escape(phrase)}(?!\w)", text))
+
+
 def _words(text: str) -> list[str]:
     return re.findall(r"[A-Za-z0-9]+", text.lower())
 
 
 def _looks_like_math(text: str) -> bool:
+    text_without_dates = re.sub(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b", " ", text)
     math_words = {
         "calculate",
         "calculation",
@@ -940,8 +1731,40 @@ def _looks_like_math(text: str) -> bool:
         "percentage",
         "probability",
         "average",
+        "binomial",
+        "coefficient",
+        "combination",
+        "combinations",
+        "frequency",
+        "wavelength",
+        "homomorphism",
+        "homomorphisms",
+        "significance",
+        "experiment",
+        "t-test",
+        "linear",
+        "transformation",
+        "confidence",
+        "interval",
+        "margin",
+        "sample",
+        "normally",
+        "distributed",
+        "standard",
+        "deviation",
+        "interquartile",
     }
-    if re.search(r"\d+\s*[\+\-\*/]\s*\d+", text):
+    if re.search(r"\\d?binom\s*\{\s*\d+\s*\}\s*\{\s*\d+\s*\}", text_without_dates):
+        return True
+    if re.search(r"\b[Cc]\s*\(\s*\d+\s*,\s*\d+\s*\)", text_without_dates):
+        return True
+    if re.search(r"\b\d+\s+choose\s+\d+\b", text_without_dates):
+        return True
+    if re.search(r"\b(significance test|t-test|homomorphisms?)\b", text_without_dates):
+        return True
+    if re.search(r"\d+\s*[\+\*/]\s*\d+", text_without_dates):
+        return True
+    if re.search(r"\d+\s+-\s+\d+", text_without_dates):
         return True
     return any(word in _words(text) for word in math_words)
 
@@ -975,7 +1798,82 @@ def _looks_factual(text: str) -> bool:
     return any(word in _words(text) for word in factual_words)
 
 
-@tool
+def _looks_recent_or_report(text: str) -> bool:
+    if re.search(r"\b(?:19|20)\d{2}[-/]\d{1,2}[-/]\d{1,2}\b", text):
+        return True
+    report_words = {"report", "according", "news", "current", "recent", "coach", "stated"}
+    return any(word in _words(text) for word in report_words)
+
+
+def _clear_torch_memory() -> None:
+    try:
+        import gc
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
+def unload_rag_runtime() -> None:
+    global _RAG_EMBED_MODEL, _RAG_CROSS_ENCODER, _RAG_SPLITTER, _RAG_RUNTIME_READY
+    _RAG_EMBED_MODEL = None
+    _RAG_CROSS_ENCODER = None
+    _RAG_SPLITTER = None
+    _RAG_RUNTIME_READY = False
+    _clear_torch_memory()
+
+
+def unload_strategy(strategy: BaseStrategy | None) -> None:
+    seen: set[int] = set()
+
+    def unload_item(item: Any) -> None:
+        if item is None:
+            return
+        marker = id(item)
+        if marker in seen:
+            return
+        seen.add(marker)
+        if hasattr(item, "unload"):
+            item.unload()
+            return
+        if isinstance(item, LocalLLMVariant):
+            unload_item(item.llm)
+            return
+        if isinstance(item, GemmaStrategy) or isinstance(item, QwenStrategy) or isinstance(item, RAGStrategy):
+            unload_item(getattr(item, "llm", None))
+        if isinstance(item, CalculatorStrategy):
+            unload_item(item.fallback_strategy)
+        if isinstance(item, RoutedStrategy):
+            unload_item(item.direct_strategy)
+            unload_item(item.rag_strategy)
+            unload_item(item.fallback_strategy)
+            unload_item(item.low_confidence_strategy)
+        if isinstance(item, CouncilStrategy):
+            for llm in item.candidate_llms:
+                unload_item(llm)
+            unload_item(item.judge_llm)
+        if isinstance(item, RoutedRAGCouncilStrategy):
+            unload_item(item.direct_strategy)
+            for llm in item.candidate_llms:
+                unload_item(llm)
+            unload_item(item.judge_llm)
+        if isinstance(item, LangChainAgenticStrategy):
+            unload_item(item.raw_llm)
+
+    unload_item(strategy)
+    _clear_torch_memory()
+
+
+def _llm_root_id(llm: Any) -> int:
+    while isinstance(llm, LocalLLMVariant):
+        llm = llm.llm
+    return id(llm)
+
+
 def web_search_tool(query: str) -> str:
     """
     Tool for modern pop culture, movies, music, recent events (up to current year 2026), 
@@ -1004,7 +1902,6 @@ def web_search_tool(query: str) -> str:
     except Exception as e:
         return f"Web search failed: {str(e)}"
 
-@tool
 def calculator_tool(expression: str) -> float:
     """
     Computes mathematical operations, this tool does.
@@ -1013,7 +1910,6 @@ def calculator_tool(expression: str) -> float:
     clean_expr = re.sub(r'[^0-9\+\-\*\/\(\)\.\s]', '', expression)
     return float(eval(clean_expr, {"__builtins__": None}, {}))
 
-@tool
 def wikipedia_tool(search_term: str) -> str:
     """
     Historical facts, biographies or general knowledge, this tool finds.
@@ -1047,12 +1943,22 @@ class LangChainAgenticStrategy(BaseStrategy):
 
     def __init__(self, raw_llm: LocalLLM, fallback_strategy: BaseStrategy | None = None):
         # Wraps your existing LocalLLM (Gemma/Qwen) into a LangChain compatible interface
+        try:
+            from langchain_core.tools import tool
+        except ImportError as exc:
+            raise RuntimeError(
+                "LangChainAgenticStrategy needs langchain-core installed. "
+                "Use the normal Gemma/Qwen/RAG strategies, or install the optional LangChain dependency."
+            ) from exc
         self.raw_llm = raw_llm
         self.fallback = fallback_strategy or HeuristicStrategy()
-        self.tools = [calculator_tool, wikipedia_tool, web_search_tool]
+        self.tools = [tool(calculator_tool), tool(wikipedia_tool), tool(web_search_tool)]
         self._setup_agent_prompts()
 
     def _setup_agent_prompts(self):
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_core.tools import render_text_description
+
         # Renderizamos las descripciones dinámicamente incluyendo DuckDuckGo
         rendered_tools = render_text_description(self.tools)
         
@@ -1302,10 +2208,10 @@ def _ensure_rag_runtime() -> None:
         chunk_overlap=80,
         separators=["\n\n", "\n", ". ", " ", ""],
     )
-    _rag_log.info("RAG: loading dense encoder")
-    _RAG_EMBED_MODEL = SentenceTransformer("BAAI/bge-small-en-v1.5")
-    _rag_log.info("RAG: loading cross-encoder")
-    _RAG_CROSS_ENCODER = CrossEncoder("BAAI/bge-reranker-base")
+    _rag_log.info("RAG: loading dense encoder on CPU")
+    _RAG_EMBED_MODEL = SentenceTransformer("BAAI/bge-small-en-v1.5", device="cpu")
+    _rag_log.info("RAG: loading cross-encoder on CPU")
+    _RAG_CROSS_ENCODER = CrossEncoder("BAAI/bge-reranker-base", device="cpu")
     _RAG_RUNTIME_READY = True
 
 
@@ -1728,7 +2634,8 @@ class RAGStrategy(BaseStrategy):
 
     def answer(self, question: Question) -> AnswerPrediction:
         try:
-            evidence, evidence_docs, retrieval_seconds = self.retriever(question.text, self.cfg, self.llm)
+            retrieval_query = _retrieval_query(question)
+            evidence, evidence_docs, retrieval_seconds = self.retriever(retrieval_query, self.cfg, self.llm)
             prompt = build_rag_prompt(question, evidence)
             raw_text = self.llm.generate(prompt, max_new_tokens=self.cfg.answer_max_new_tokens)
             prediction = parse_answer_prediction(raw_text, question, strategy_name=self.name)
@@ -1736,6 +2643,7 @@ class RAGStrategy(BaseStrategy):
                 "strategy": self.name,
                 "model_name": getattr(self.llm, "model_name", "unknown"),
                 "device": getattr(self.llm, "device_summary", "unknown"),
+                "retrieval_query": retrieval_query,
                 "num_evidence_chunks": len(evidence_docs),
                 "retrieval_seconds": round(retrieval_seconds, 2),
                 "evidence_preview": evidence[:1200],

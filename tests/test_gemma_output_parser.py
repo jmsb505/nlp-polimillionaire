@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from polimillionaire.strategies import parse_answer_prediction
+from polimillionaire.types import AnswerOption, Question
 
 
 def test_parser_handles_valid_json(sample_question):
@@ -43,3 +44,20 @@ def test_parser_handles_truncated_json_reason(sample_question):
     assert prediction.option_id == 1
     assert prediction.confidence == 0.9
     assert prediction.reasoning == "The film heavily implies the"
+
+
+def test_parser_matches_partial_distinctive_option_text():
+    question = Question(
+        id=99,
+        text="Which significance test is correct?",
+        options=[
+            AnswerOption(0, "A two-sample t-test"),
+            AnswerOption(1, "A matched pairs t-test"),
+            AnswerOption(2, "A two-proportion z-test"),
+            AnswerOption(3, "A chi-square test of independence"),
+        ],
+    )
+    raw = "The setup creates a matched pairs design because each subject receives both treatments."
+    prediction = parse_answer_prediction(raw, question, strategy_name="test")
+    assert prediction.option_id == 1
+    assert prediction.metadata["fallback"] is False

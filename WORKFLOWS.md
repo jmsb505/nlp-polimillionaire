@@ -9,9 +9,9 @@ Keep it simple: run the notebook, edit helpers only when needed.
 3. Pick models in `MODELS_TO_TEST`.
 4. Run the selected local models on the sample question.
 5. Open `notebooks/game_testing_notebook.ipynb`.
-6. Pick models and competition.
-7. Login and run the selected models one after another.
-8. Read `results/runs/`.
+6. Keep `RUN_LIVE_GAME = True` for the exploratory live sweep.
+7. Run every enabled architecture across the six categories.
+8. Compare category results from `results/runs/`.
 
 ## Add A New Heuristic
 
@@ -73,21 +73,23 @@ After editing:
 
 ## Try The Council
 
-In a notebook model list, set `run=True` for `Gemma 4 E2B Council`.
+Use the architecture grid in `game_testing_notebook.ipynb`.
 
-It runs one loaded Gemma model three times with sampling and different seeds. A majority answer is used directly. The deterministic judge is only used if the votes do not have a majority.
+The current useful council rows are:
 
-Use the sample notebook first. In a live game it makes four generations per question, so latency matters.
+- `Gemma E2B 4-bit tools + RAG council`;
+- `Qwen 3.5 2B 4-bit tools + RAG council`;
+- `Data-routed Gemma/Qwen/tools franken`.
 
-For a different model perspective, choose `Gemma + Qwen Mixed Council (4-bit)` in the game notebook. Install `bitsandbytes` in that notebook kernel first:
+These use the newer tools/RAG/router work. The older raw single-model rows are kept as manual checks, but they are not the default comparison anymore.
+
+Install `bitsandbytes` in the notebook kernel first:
 
 ```python
 %pip install -U bitsandbytes
 ```
 
-It uses the class NF4/double-quantization recipe so Gemma and short non-thinking Qwen can fit together more reliably. It is another `MODELS_TO_RUN` choice, not a separate pipeline. Turn on `RUN_OFFLINE_BENCHMARK` before running this option live.
-
-To compare it fairly, run `Gemma 4 E2B (4-bit)` and `Gemma + Qwen Mixed Council (4-bit)` with `RUN_LIVE_GAME = False`. Only this quantized mixed option restricts its judge to candidate answers and falls back to the Gemma vote instead of comparing model confidence scores. Existing council choices keep their earlier behavior.
+The full architecture grid is now the exploratory live sweep. It clears memory between architectures so each run starts cleanly.
 
 ## Change Live Game Logic
 
