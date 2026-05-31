@@ -12,3 +12,5 @@ results/runs/*.jsonl
 results/analysis/*
 *.html
 .DS_Store
+*.wav
+data/llama-cpp
