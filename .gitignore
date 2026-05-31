@@ -11,3 +11,4 @@ data/hf_home/
 results/runs/*.jsonl
 results/analysis/*
 *.html
+.DS_Store
