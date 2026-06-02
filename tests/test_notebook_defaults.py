@@ -122,6 +122,8 @@ def test_clean_submission_notebook_is_self_contained_and_simpler():
     assert "RUN_BEST_BY_CATEGORY = True" in code
     assert "COMPETITION_IDS = [0, 1, 2, 3, 4, 5]" in code
     assert "CLEAR_MEMORY_AFTER_EACH_MODEL = True" in code
+    assert "HF_HOME" in code
+    assert "HUGGINGFACE_HUB_CACHE" in code
     assert "run_results = run_all_categories()" in code
     assert "show_results(run_results)" in code
     assert "SpeechGameRunner" not in code
@@ -197,6 +199,7 @@ def test_minimal_submission_notebook_is_trimmed_and_functional():
     assert "RUN_BEST_BY_CATEGORY = True" in code
     assert "COMPETITION_IDS = [0, 1, 2, 3, 4, 5]" in code
     assert "CLEAR_MEMORY_AFTER_EACH_MODEL = True" in code
+    assert "SHOW_MODEL_DEVICES = False" in code
     assert "run_results = run_all_categories()" in code
     assert "summary_df = show_results(run_results)" in code
     assert "LangChainAgenticStrategy" not in code
@@ -224,6 +227,18 @@ def test_minimal_submission_notebook_is_trimmed_and_functional():
 
     route_question = namespace["route_question"]
     rule_answer = namespace["rule_answer"]
+    normalize_result = namespace["normalize_result"]
+
+    result = normalize_result({"correct": True, "gameOver": False, "earnedAmount": 4000, "currentLevel": 8})
+    assert result["game_over"] is False
+    assert result["earned_amount"] == 4000
+    assert result["current_level"] == 8
+
+    assert "from ddgs import DDGS" in code
+    assert '"duckduckgo-search"' not in code
+    assert "generation_token_ids" in code
+    assert 'kwargs["pad_token_id"]' in code
+    assert "set_verbosity_error()" in code
 
     bayes_question = {
         "id": 1,
@@ -241,6 +256,20 @@ def test_minimal_submission_notebook_is_trimmed_and_functional():
     assert decision["route"] == "rag"
     assert decision["reason"] == "factual"
 
+    zoo_tv_question = {
+        "id": 5,
+        "text": "What was the primary goal of U2's music during the Zoo TV tour in 1992-1993?",
+        "options": [{"id": 0, "text": "To explore electronic dance music"}, {"id": 1, "text": "To promote their live performances"}, {"id": 2, "text": "To support the release of a new album"}, {"id": 3, "text": "To challenge television in daily life"}],
+    }
+    assert route_question(zoo_tv_question)["route"] == "rag"
+
+    dated_news_question = {
+        "id": 6,
+        "text": "According to the article published on 2026-05-14, which company conducted the experiment?",
+        "options": [{"id": 0, "text": "Google"}, {"id": 1, "text": "JP Morgan"}, {"id": 2, "text": "Walmart"}, {"id": 3, "text": "Emergence AI"}],
+    }
+    assert route_question(dated_news_question)["route"] == "rag"
+
     bias_question = {
         "id": 3,
         "text": "A scientist investigated the effect of workplace stress on heart disease in humans. Men of various ages were divided into two groups based on whether they described their work as very stressful or not very stressful. During the one year investigation the scientist monitored the heart health of each man. What was the bias in this investigation?",
@@ -254,3 +283,24 @@ def test_minimal_submission_notebook_is_trimmed_and_functional():
         "options": [{"id": 0, "text": "R > T > S > P"}, {"id": 1, "text": "T > R > P > S"}, {"id": 2, "text": "R > P and T > R and P > S"}, {"id": 3, "text": "R > P > T > S"}],
     }
     assert rule_answer(dilemma_question)["option_id"] == 2
+
+    square_root_question = {
+        "id": 7,
+        "text": "What is the least possible positive integer value of n such that sqrt{18 n} is an integer?",
+        "options": [{"id": 0, "text": "8"}, {"id": 1, "text": "3"}, {"id": 2, "text": "2"}, {"id": 3, "text": "10"}],
+    }
+    assert rule_answer(square_root_question)["option_id"] == 2
+
+    shadow_question = {
+        "id": 8,
+        "text": "The BEST way to make a shadow on a living room wall is to",
+        "options": [{"id": 0, "text": "stand between a light and the wall"}, {"id": 1, "text": "hold a lamp near the floor"}, {"id": 2, "text": "sit close to the wall near a window"}, {"id": 3, "text": "turn off the lights in the room"}],
+    }
+    assert rule_answer(shadow_question)["option_id"] == 0
+
+    electrical_question = {
+        "id": 9,
+        "text": "Which is an example of a form of electrical energy?",
+        "options": [{"id": 0, "text": "sound waves"}, {"id": 1, "text": "windmill"}, {"id": 2, "text": "radio waves"}, {"id": 3, "text": "lightning"}],
+    }
+    assert rule_answer(electrical_question)["option_id"] == 3
