@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 
@@ -195,15 +196,23 @@ def test_minimal_submission_notebook_is_trimmed_and_functional():
 
     code = "\n\n".join("".join(cell.get("source", [])) for cell in code_cells)
     assert "RUN_LIVE_GAME = True" in code
+    assert "RUN_LOCAL_BENCHMARK = True" in code
+    assert "USE_LOCAL_BENCHMARK_SELECTION = True" in code
     assert "RUN_OFFLINE_BENCHMARK = False" in code
     assert "RUN_BEST_BY_CATEGORY = True" in code
     assert "COMPETITION_IDS = [0, 1, 2, 3, 4, 5]" in code
     assert "CLEAR_MEMORY_AFTER_EACH_MODEL = True" in code
+    assert "CLEAR_MEMORY_AFTER_EACH_ARCHITECTURE = True" in code
     assert "SHOW_MODEL_DEVICES = False" in code
     assert "run_results = run_all_categories()" in code
     assert "summary_df = show_results(run_results)" in code
+    assert "Local benchmark" in code or "Local benchmark" in "\n".join(
+        "".join(cell.get("source", [])) for cell in notebook["cells"]
+    )
     assert "LangChainAgenticStrategy" not in code
     assert "DataRoutedFrankenStrategy" not in code
+    assert "data-routed" not in code.lower()
+    assert "franken" not in code.lower()
     assert "SpeechGameRunner" not in code
     assert "class RandomStrategy" not in code
     assert "class HeuristicStrategy" not in code
@@ -217,6 +226,11 @@ def test_minimal_submission_notebook_is_trimmed_and_functional():
         '"qwen_two_agent_quant_council"',
         '"mixed_gemma_qwen_routed_rag"',
         '"gemma_e2b_routed_rag"',
+        '"label": "Gemma E2B"',
+        '"label": "Gemma E2B 4-bit"',
+        '"label": "Qwen 2B thinking"',
+        '"label": "Gemma + Qwen 4-bit + RAG"',
+        '"label": "Category router"',
     ]:
         assert expected in code
 
@@ -304,3 +318,118 @@ def test_minimal_submission_notebook_is_trimmed_and_functional():
         "options": [{"id": 0, "text": "sound waves"}, {"id": 1, "text": "windmill"}, {"id": 2, "text": "radio waves"}, {"id": 3, "text": "lightning"}],
     }
     assert rule_answer(electrical_question)["option_id"] == 3
+
+
+def test_local_benchmark_csv_has_required_shape():
+    root = Path(__file__).parents[1]
+    csv_path = root / "data" / "local_benchmark" / "question_bank.csv"
+    assert csv_path.exists()
+
+    required = {
+        "bank_id",
+        "category_id",
+        "category",
+        "source_log",
+        "question",
+        "option_0",
+        "option_1",
+        "option_2",
+        "option_3",
+        "gold_option_id",
+        "topic_tag",
+        "why_included",
+    }
+    rows = list(csv.DictReader(csv_path.open(encoding="utf-8")))
+    assert rows
+    assert required.issubset(rows[0])
+
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["category"]] = counts.get(row["category"], 0) + 1
+        assert row["question"].strip()
+        assert int(row["gold_option_id"]) in {0, 1, 2, 3}
+        for option_index in range(4):
+            assert row[f"option_{option_index}"].strip()
+
+    assert len(counts) == 6
+    assert all(count >= 5 for count in counts.values())
+
+
+def test_minimal_submission_setup_names_are_clean():
+    root = Path(__file__).parents[1]
+    notebook_path = root / "notebooks" / "submission_notebook_minimal.ipynb"
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    settings_source = "".join(notebook["cells"][7].get("source", []))
+
+    namespace: dict[str, object] = {"os": __import__("os"), "pd": __import__("pandas")}
+    exec(settings_source, namespace)
+    architectures = namespace["ARCHITECTURES"]
+
+    for key, item in architectures.items():
+        label = item["label"]
+        assert "franken" not in label.lower()
+        assert "data-routed" not in label.lower()
+        if "4-bit" in label:
+            assert item.get("quantized") is True, key
+
+    expected_labels = {
+        "Heuristic baseline",
+        "Gemma E2B",
+        "Gemma E4B",
+        "Qwen 2B",
+        "Qwen 2B thinking",
+        "Gemma E2B 4-bit",
+        "Gemma E4B 4-bit",
+        "Qwen 2B 4-bit",
+        "Gemma E2B 4-bit + RAG",
+        "Gemma E4B 4-bit + RAG",
+        "Qwen 2B 4-bit + RAG",
+        "Gemma 4-bit council",
+        "Qwen 4-bit council",
+        "Gemma + Qwen council",
+        "Gemma + Qwen 4-bit council",
+        "Gemma + Qwen 4-bit + RAG",
+        "Category router",
+    }
+    assert {item["label"] for item in architectures.values()} == expected_labels
+
+
+def test_minimal_submission_benchmark_selection_works_with_fake_rows():
+    root = Path(__file__).parents[1]
+    notebook_path = root / "notebooks" / "submission_notebook_minimal.ipynb"
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+
+    namespace: dict[str, object] = {}
+    for cell in notebook["cells"]:
+        if cell.get("cell_type") == "code" and cell.get("metadata", {}).get("jupyter", {}).get("source_hidden"):
+            exec("".join(cell.get("source", [])), namespace)
+
+    pd = namespace["pd"]
+    select_benchmark_setups = namespace["select_benchmark_setups"]
+    fake_results = pd.DataFrame(
+        [
+            {"setup_key": "a", "setup": "Setup A", "category_id": 0, "category": "entertainment", "correct": True, "seconds": 2.0, "fallback": False},
+            {"setup_key": "a", "setup": "Setup A", "category_id": 1, "category": "history", "correct": False, "seconds": 1.0, "fallback": False},
+            {"setup_key": "b", "setup": "Setup B", "category_id": 0, "category": "entertainment", "correct": False, "seconds": 1.0, "fallback": False},
+            {"setup_key": "b", "setup": "Setup B", "category_id": 1, "category": "history", "correct": True, "seconds": 1.0, "fallback": False},
+            {"setup_key": "b", "setup": "Setup B", "category_id": 1, "category": "history", "correct": True, "seconds": 1.1, "fallback": False},
+        ]
+    )
+
+    selected_by_category, selected_overall = select_benchmark_setups(fake_results)
+    assert selected_by_category[0] == "a"
+    assert selected_by_category[1] == "b"
+    assert selected_overall == "b"
+
+
+def test_minimal_submission_live_functions_do_not_read_benchmark_bank():
+    root = Path(__file__).parents[1]
+    notebook_path = root / "notebooks" / "submission_notebook_minimal.ipynb"
+    notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+    answer_source = "".join(notebook["cells"][15].get("source", []))
+    runner_source = "".join(notebook["cells"][18].get("source", []))
+
+    assert "load_question_bank" not in answer_source
+    assert "load_question_bank" not in runner_source
+    assert "QUESTION_BANK_ROWS" not in answer_source
+    assert "QUESTION_BANK_ROWS" not in runner_source
