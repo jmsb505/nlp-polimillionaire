@@ -108,6 +108,46 @@ def test_calculator_handles_wave_frequency_question():
     assert prediction.metadata["calculation_method"] == "wave_frequency"
 
 
+def test_calculator_handles_wave_frequency_without_of_word():
+    question = _question(
+        "An organ pipe produces a note with wavelength 2.67 m. If the speed of sound is 343 m/s, what is the frequency?",
+        ["85.7 Hz", "128 Hz", "343 Hz", "2.67 Hz"],
+    )
+    prediction = CalculatorStrategy().answer(question)
+    assert prediction.option_id == 1
+    assert prediction.metadata["calculation_method"] == "wave_frequency"
+
+
+def test_calculator_handles_explicit_sum_of_squares():
+    question = _question(
+        "What is 1^2 + 2^2 + 3^2 + 4^2?",
+        ["16", "24", "30", "40"],
+    )
+    prediction = CalculatorStrategy().answer(question)
+    assert prediction.option_id == 2
+    assert prediction.metadata["calculation_method"] == "sum_of_squares"
+
+
+def test_calculator_handles_distance_speed_time_question():
+    question = _question(
+        "How much time is required for a bicycle to travel a distance of 100 meters at an average speed of 2 meters per second?",
+        ["200 seconds", "50 seconds", "0.02 seconds", "100 seconds"],
+    )
+    prediction = CalculatorStrategy().answer(question)
+    assert prediction.option_id == 1
+    assert prediction.metadata["calculation_method"] == "time_distance_speed"
+
+
+def test_calculator_handles_correlation_transform_question():
+    question = _question(
+        "Suppose the correlation between two variables is 0.19. What is the new correlation if 0.23 is added to all values of x, y is doubled, and the variables are interchanged?",
+        ["0.84", "0.42", "0.19", "-0.19"],
+    )
+    prediction = CalculatorStrategy().answer(question)
+    assert prediction.option_id == 2
+    assert prediction.metadata["calculation_method"] == "correlation_transform"
+
+
 def test_calculator_handles_matched_pairs_statistics_question():
     question = _question(
         "Volunteers tried the old formula on one side of their face and the new formula on the other. The response variable was the difference in pimples. Which significance test is correct?",

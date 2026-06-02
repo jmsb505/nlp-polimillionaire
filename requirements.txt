@@ -18,4 +18,8 @@ sentence-transformers>=3.0
 rank_bm25>=0.2.2
 newspaper3k>=0.2.8
 bitsandbytes>=0.43
-
+python-dotenv>=1.0
+scipy>=1.11
+silero-vad>=5.1
+llama-cpp-python>=0.2.90
+faster-whisper>=1.1.0

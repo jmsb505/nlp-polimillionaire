@@ -959,6 +959,7 @@ def build_prompt(question: Question) -> str:
     return "\n\n".join(
         [
             "Answer the multiple-choice question.",
+            _speech_asr_note(question),
             negation_note,
             "Return exactly: option_id: <number>",
             f"Question: {question.text}",
@@ -976,6 +977,7 @@ def build_qwen_prompt(question: Question) -> str:
     )
     return "\n\n".join(
         [
+            _speech_asr_note(question),
             negation_note,
             f"Question: {question.text}",
             options,
@@ -989,6 +991,7 @@ def build_council_vote_prompt(question: Question, option_order: list[Any] | None
     return "\n\n".join(
         [
             "Pick the best answer. Check words such as NOT and EXCEPT.",
+            _speech_asr_note(question),
             "Return JSON with keys option_id, confidence, and reason. Use the listed numeric ID. Keep the reason short.",
             f"Q: {question.text}",
             options,
@@ -1015,6 +1018,7 @@ def build_judge_prompt(
     return "\n\n".join(
         [
             f"Choose the final answer from the candidates. {scope_text} Return only the option id number.",
+            _speech_asr_note(question),
             f"Q: {question.text}",
             options,
             summaries,
@@ -1045,6 +1049,7 @@ def build_rag_council_judge_prompt(
         [
             "You are the final judge for a multiple-choice quiz.",
             scope_text,
+            _speech_asr_note(question),
             "Use candidate agreement, confidence, short reasons, and evidence if it is relevant.",
             "If options overlap, prefer the complete option explicitly supported by evidence over a shorter related title.",
             "Do not choose a candidate whose own reason says the answer is not mentioned or unsupported.",
@@ -1085,12 +1090,23 @@ def build_rag_council_vote_prompt(
     return "\n\n".join(
         [
             instruction,
+            _speech_asr_note(question),
             "Return ONLY JSON: {\"option_id\": <number>, \"confidence\": <0-1>, \"reason\": \"short\"}",
             "Evidence:",
             evidence_text,
             f"Question: {question.text}",
             options,
         ]
+    )
+
+
+def _speech_asr_note(question: Question) -> str:
+    if question.metadata.get("mode") != "speech":
+        return ""
+    return (
+        "Speech-mode note: question and options are ASR transcripts and may contain errors. "
+        "Ignore obvious audio artifacts such as option labels, pfft, laughter, or garbled words. "
+        "Infer the likely answer, then choose the closest listed option ID."
     )
 
 
@@ -1431,6 +1447,12 @@ def _solve_math_question(question: Question) -> tuple[Any, Any, str] | None:
         value = _normal_iqr_value(text)
         method = "normal_iqr"
     if value is None:
+        value = _correlation_transform_value(text)
+        method = "correlation_transform"
+    if value is None:
+        value = _time_distance_speed_value(text)
+        method = "time_distance_speed"
+    if value is None:
         value = _combination_value(text)
         method = "combination"
     if value is None:
@@ -1554,6 +1576,34 @@ def _normal_iqr_value(text: str) -> float | None:
     return round(1.35 * float(match.group(1)), 2)
 
 
+def _correlation_transform_value(text: str) -> float | None:
+    lowered = text.lower()
+    if "correlation" not in lowered:
+        return None
+    if not any(token in lowered for token in ("added to all values", "doubled", "interchanged", "swapped")):
+        return None
+    match = re.search(r"correlation(?:\s+between\s+two\s+variables)?\s+(?:is|=)\s*(-?\d+(?:\.\d+)?)", lowered)
+    if not match:
+        return None
+    value = float(match.group(1))
+    return int(value) if value.is_integer() else value
+
+
+def _time_distance_speed_value(text: str) -> float | None:
+    lowered = text.lower()
+    if not all(token in lowered for token in ("time", "distance", "speed")):
+        return None
+    distance_match = re.search(r"distance(?:\s+of)?\s+(\d+(?:\.\d+)?)\s*(?:meters?|m)\b", lowered)
+    speed_match = re.search(r"speed(?:\s+of)?\s+(\d+(?:\.\d+)?)\s*(?:meters?|m)\s+per\s+second", lowered)
+    if not distance_match or not speed_match:
+        return None
+    speed = float(speed_match.group(1))
+    if speed <= 0:
+        return None
+    value = float(distance_match.group(1)) / speed
+    return int(round(value)) if abs(value - round(value)) < 1e-6 else value
+
+
 def _option_with_terms(question: Question, terms: set[str]) -> Any | None:
     best = None
     best_score = 0
@@ -1594,7 +1644,7 @@ def _frequency_value(text: str) -> float | None:
     lowered = text.lower()
     if "frequency" not in lowered or "wavelength" not in lowered or "speed" not in lowered:
         return None
-    wavelength_match = re.search(r"wavelength\s+of\s+(\d+(?:\.\d+)?)\s*m\b", lowered)
+    wavelength_match = re.search(r"wavelength(?:\s+of)?\s+(\d+(?:\.\d+)?)\s*m\b", lowered)
     speed_match = re.search(r"speed(?:\s+of\s+sound)?\s+is\s+(\d+(?:\.\d+)?)\s*m/s\b", lowered)
     if not wavelength_match or not speed_match:
         return None
@@ -1603,22 +1653,24 @@ def _frequency_value(text: str) -> float | None:
     if wavelength <= 0:
         return None
     value = speed / wavelength
-    return int(round(value)) if abs(value - round(value)) < 0.2 else value
+    return int(round(value)) if abs(value - round(value)) < 0.6 else value
 
 
 def _sum_of_squares_value(text: str) -> int | None:
     lowered = text.lower()
-    if "^2" not in lowered or not any(token in lowered for token in ("cdots", "...", "…")):
+    if "^2" not in lowered:
         return None
     target = re.split(r"value of|calculate|what is", lowered, maxsplit=1)
     segment = target[-1] if target else lowered
     nums = [int(value) for value in re.findall(r"(\d+)\s*\^\s*2", segment)]
     if len(nums) < 2:
         return None
-    start, end = nums[0], nums[-1]
-    if start > end:
-        return None
-    return sum(number * number for number in range(start, end + 1))
+    if any(token in segment for token in ("cdots", "...", "…")):
+        start, end = nums[0], nums[-1]
+        if start > end:
+            return None
+        return sum(number * number for number in range(start, end + 1))
+    return sum(number * number for number in nums)
 
 
 def _arithmetic_value(text: str) -> int | float | None:
@@ -1737,6 +1789,9 @@ def _looks_like_math(text: str) -> bool:
         "combinations",
         "frequency",
         "wavelength",
+        "correlation",
+        "distance",
+        "speed",
         "homomorphism",
         "homomorphisms",
         "significance",

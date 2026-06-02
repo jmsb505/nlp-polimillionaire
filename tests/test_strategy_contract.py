@@ -18,7 +18,10 @@ from polimillionaire.strategies import (
     QwenStrategy,
     RandomStrategy,
     build_council_vote_prompt,
+    build_prompt,
+    build_qwen_prompt,
 )
+from polimillionaire.types import AnswerOption, Question
 
 
 def test_rag_models_are_lazy_loaded_on_import():
@@ -238,3 +241,21 @@ def test_council_accepts_different_candidate_models(sample_question):
 def test_council_prompt_does_not_anchor_a_specific_option(sample_question):
     prompt = build_council_vote_prompt(sample_question)
     assert '"option_id": 0' not in prompt
+
+
+def test_speech_prompts_warn_about_noisy_asr():
+    question = Question(
+        1,
+        "But genre did Ray Charles Pioneer?",
+        [
+            AnswerOption(0, "hip hop"),
+            AnswerOption(1, "rock and roll"),
+            AnswerOption(2, "country"),
+            AnswerOption(3, "So"),
+        ],
+        metadata={"mode": "speech"},
+    )
+
+    for prompt in (build_prompt(question), build_qwen_prompt(question), build_council_vote_prompt(question)):
+        assert "ASR transcripts" in prompt
+        assert "closest listed option ID" in prompt

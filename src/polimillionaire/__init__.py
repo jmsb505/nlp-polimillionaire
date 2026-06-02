@@ -1,5 +1,5 @@
 from polimillionaire.types import AnswerOption, AnswerPrediction, Question
-from polimillionaire.runner import GameRunner, RunLogger, benchmark_strategy, load_jsonl, summarize_attempts
+from polimillionaire.runner import GameRunner, RunLogger, SpeechGameRunner, benchmark_strategy, load_jsonl, summarize_attempts
 from polimillionaire.strategies import (
     CouncilStrategy,
     CalculatorStrategy,
@@ -36,6 +36,7 @@ __all__ = [
     "RunLogger",
     "RoutedRAGCouncilStrategy",
     "RoutedStrategy",
+    "SpeechGameRunner",
     "benchmark_strategy",
     "load_jsonl",
     "route_question",

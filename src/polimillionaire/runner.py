@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from polimillionaire.strategies import BaseStrategy
 from polimillionaire.types import AnswerOption, AnswerPrediction, Question
@@ -76,15 +76,21 @@ class GameRunner:
                 break
         return game
 
-    def _safe_answer(self, strategy: BaseStrategy, question: Question) -> AnswerPrediction:
+    def _safe_answer(
+        self,
+        strategy: BaseStrategy,
+        question: Question,
+        timeout_seconds: float | None = None,
+    ) -> AnswerPrediction:
         fallback = _fallback_prediction(question, "Strategy failed or timed out.")
+        timeout_seconds = self.answer_timeout_seconds if timeout_seconds is None else timeout_seconds
         executor = ThreadPoolExecutor(max_workers=1)
         try:
             future = executor.submit(strategy.answer, question)
-            prediction = future.result(timeout=self.answer_timeout_seconds)
+            prediction = future.result(timeout=timeout_seconds)
         except TimeoutError:
             executor.shutdown(wait=False, cancel_futures=True)
-            fallback.metadata["error"] = f"Timed out after {self.answer_timeout_seconds}s"
+            fallback.metadata["error"] = f"Timed out after {timeout_seconds}s"
             return fallback
         except Exception as exc:
             executor.shutdown(wait=False, cancel_futures=True)
@@ -113,6 +119,139 @@ class GameRunner:
                 elapsed_seconds=elapsed_seconds,
                 strategy_name=getattr(strategy, "name", strategy.__class__.__name__),
             )
+
+
+class SpeechGameRunner(GameRunner):
+    def __init__(
+        self,
+        client: Any,
+        safe_delay_seconds: float = 1.0,
+        answer_timeout_seconds: float = 25.0,
+        logger: "RunLogger | None" = None,
+        transcriber: Callable[[bytes], str] | None = None,
+        audio_dir: str | Path | None = None,
+        audio_fetch_delay_seconds: float = 0.2,
+    ):
+        super().__init__(client, safe_delay_seconds, answer_timeout_seconds, logger)
+        self.transcriber = transcriber
+        self.audio_dir = Path(audio_dir) if audio_dir is not None else None
+        self.audio_fetch_delay_seconds = max(0.0, audio_fetch_delay_seconds)
+
+    def play(self, competition_id: int, strategy: BaseStrategy) -> Any:
+        self.safe_delay.wait()
+        game = self.client.game.start(competition_id=competition_id, mode="speech")
+        while game.in_progress:
+            if game.current_question is None:
+                break
+            self.safe_delay.wait()
+            fetch_started_at = time.monotonic()
+            question_audio = game.fetch_audio_question()
+            self._sleep_between_audio_requests()
+            option_audios = []
+            for _ in range(len(getattr(game.current_question, "options", [])) or 4):
+                option_audios.append(game.fetch_audio_option_next())
+                self._sleep_between_audio_requests()
+            audio_fetch_seconds = time.monotonic() - fetch_started_at
+            if hasattr(game, "refresh_state"):
+                try:
+                    game.refresh_state()
+                except Exception:
+                    pass
+
+            started_at = time.monotonic()
+            question = self._question_from_audio(game, question_audio, option_audios, audio_fetch_seconds)
+            remaining_before_strategy = getattr(game, "time_remaining", None)
+            question.metadata["time_remaining_before_strategy"] = remaining_before_strategy
+            strategy_timeout = self.answer_timeout_seconds
+            if remaining_before_strategy is not None:
+                strategy_timeout = min(strategy_timeout, max(1.0, float(remaining_before_strategy) - 1.0))
+            if remaining_before_strategy is not None and remaining_before_strategy <= 1.0:
+                prediction = _fallback_prediction(question, "Not enough time after speech transcription.")
+            else:
+                prediction = self._safe_answer(strategy, question, timeout_seconds=strategy_timeout)
+            elapsed = time.monotonic() - started_at
+            try:
+                result = game.answer(prediction.option_id)
+            except Exception as exc:
+                result = SubmissionErrorResult(error=str(exc))
+                self._log(question, prediction, result, elapsed, strategy)
+                break
+            self._log(question, prediction, result, elapsed, strategy)
+            if getattr(result, "game_over", False):
+                break
+        return game
+
+    def _question_from_audio(
+        self,
+        game: Any,
+        question_audio: bytes,
+        option_audios: list[bytes],
+        audio_fetch_seconds: float,
+    ) -> Question:
+        client_question = game.current_question
+        option_ids = [
+            int(getattr(option, "id", index))
+            for index, option in enumerate(getattr(client_question, "options", []))
+        ]
+        if not option_ids:
+            option_ids = list(range(len(option_audios)))
+
+        q_text, q_error = self._safe_transcribe(question_audio)
+        option_texts = []
+        option_errors = []
+        for index, audio in enumerate(option_audios):
+            text, error = self._safe_transcribe(audio)
+            option_texts.append(text or f"Option {chr(65 + index)}")
+            option_errors.append(error)
+
+        question_id = int(getattr(client_question, "id", getattr(game, "current_level", 0) or 0))
+        level = int(getattr(client_question, "level", getattr(game, "current_level", 0) or 0) or 0)
+        question_text = q_text or "Speech question transcript unavailable."
+        options = [
+            AnswerOption(id=option_ids[index], text=option_texts[index])
+            for index in range(min(len(option_ids), len(option_texts)))
+        ]
+        if not options:
+            options = [AnswerOption(id=0, text="Option A")]
+        self._save_audio(question_audio, question_id, level, "question")
+        for index, audio in enumerate(option_audios):
+            self._save_audio(audio, question_id, level, f"option_{chr(65 + index)}")
+        return Question(
+            id=question_id,
+            text=question_text,
+            options=options,
+            level=level,
+            metadata={
+                "source": "millionaire_client",
+                "mode": "speech",
+                "audio_fetch_seconds": audio_fetch_seconds,
+                "time_remaining_after_audio_fetch": getattr(game, "time_remaining", None),
+                "question_transcription_error": q_error,
+                "option_transcription_errors": option_errors,
+            },
+        )
+
+    def _safe_transcribe(self, audio_bytes: bytes) -> tuple[str, str | None]:
+        try:
+            transcriber = self.transcriber
+            if transcriber is None:
+                from polimillionaire.transcribe import transcribe
+
+                transcriber = transcribe
+            return str(transcriber(audio_bytes)).strip(), None
+        except Exception as exc:
+            return "", str(exc)
+
+    def _save_audio(self, audio_bytes: bytes, question_id: int, level: int, label: str) -> None:
+        if self.audio_dir is None:
+            return
+        self.audio_dir.mkdir(parents=True, exist_ok=True)
+        path = self.audio_dir / f"level_{level}_question_{question_id}_{label}.wav"
+        path.write_bytes(audio_bytes)
+
+    def _sleep_between_audio_requests(self) -> None:
+        if self.audio_fetch_delay_seconds > 0:
+            time.sleep(self.audio_fetch_delay_seconds)
 
 
 class RunLogger:
