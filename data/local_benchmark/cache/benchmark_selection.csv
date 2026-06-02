@@ -1,0 +1,8 @@
+selection,category,setup,setup_key,category_id
+best overall,all,Gemma E2B 4-bit + RAG,gemma_e2b_routed_rag,
+best by category,entertainment,Gemma E2B 4-bit + RAG,gemma_e2b_routed_rag,0
+best by category,history,Gemma + Qwen 4-bit + RAG,mixed_gemma_qwen_routed_rag,1
+best by category,science,Gemma 4-bit council,gemma_e2b_two_agent_quant_council,2
+best by category,math,Qwen 2B 4-bit + RAG,qwen_2b_routed_rag,3
+best by category,philosophy_psychology,Gemma E2B 4-bit + RAG,gemma_e2b_routed_rag,4
+best by category,news,Qwen 2B 4-bit + RAG,qwen_2b_routed_rag,5

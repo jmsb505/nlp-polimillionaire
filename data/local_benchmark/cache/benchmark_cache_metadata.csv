@@ -1,0 +1,3 @@
+key,value
+source,recovered_from_saved_notebook_output
+note,"Per-question predictions were not displayed in the saved notebook output, so this cache stores the recovered visible benchmark tables."

@@ -1,0 +1,7 @@
+setup_key,category_id,category,setup,accuracy,avg_seconds,fallbacks,selection_source,previous_best_earned
+gemma_e2b_routed_rag,0,entertainment,Gemma E2B 4-bit + RAG,1.0,8.7938,0,local benchmark,
+mixed_gemma_qwen_routed_rag,1,history,Gemma + Qwen 4-bit + RAG,,,,previous live result,1024000
+gemma_e2b_two_agent_quant_council,2,science,Gemma 4-bit council,,,,previous live result,1024000
+qwen_2b_routed_rag,3,math,Qwen 2B 4-bit + RAG,0.4,1.6188,0,local benchmark,
+gemma_e2b_routed_rag,4,philosophy_psychology,Gemma E2B 4-bit + RAG,,,,previous live result,1024000
+qwen_2b_routed_rag,5,news,Qwen 2B 4-bit + RAG,1.0,11.9218,0,local benchmark,

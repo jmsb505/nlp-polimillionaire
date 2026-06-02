@@ -1,0 +1,18 @@
+setup_key,setup,accuracy,questions,avg_seconds,max_seconds,fallbacks
+gemma_e2b_routed_rag,Gemma E2B 4-bit + RAG,0.733333,30,9.203667,17.438,0
+qwen_2b_routed_rag,Qwen 2B 4-bit + RAG,0.7,30,7.1125,14.5,0
+qwen_two_agent_quant_council,Qwen 4-bit council,0.633333,30,12.5182,28.156,0
+gemma_e2b_two_agent_quant_council,Gemma 4-bit council,0.6,30,16.651033,37.907,0
+qwen_2b,Qwen 2B,0.566667,30,1.7,2.031,0
+gemma_e2b,Gemma E2B,0.566667,30,2.660933,3.203,0
+gemma_e4b,Gemma E4B,0.533333,30,10.473967,10.75,3
+qwen_2b_4bit,Qwen 2B 4-bit,0.466667,30,2.547933,2.641,0
+gemma_e2b_4bit,Gemma E2B 4-bit,0.433333,30,3.9125,4.25,0
+heuristic_baseline,Heuristic baseline,0.233333,30,0.0,0.0,26
+mixed_gemma_qwen_council,Gemma + Qwen council,0.233333,30,0.353133,10.407,26
+qwen_2b_thinking,Qwen 2B thinking,0.166667,30,1.7156,1.89,2
+gemma_e4b_4bit,Gemma E4B 4-bit,0.166667,30,0.0,0.0,30
+gemma_e4b_routed_rag,Gemma E4B 4-bit + RAG,0.166667,30,0.0,0.0,30
+mixed_gemma_qwen_4bit_council,Gemma + Qwen 4-bit council,0.166667,30,0.0,0.0,30
+mixed_gemma_qwen_routed_rag,Gemma + Qwen 4-bit + RAG,0.166667,30,0.0,0.0,30
+category_router,Category router,0.166667,30,32.1245,89.593,30

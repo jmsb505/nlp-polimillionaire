@@ -1,0 +1,7 @@
+category_id,setup_key,competition_id,category,setup
+0,gemma_e2b_routed_rag,0,entertainment,Gemma E2B 4-bit + RAG
+1,mixed_gemma_qwen_routed_rag,1,history,Gemma + Qwen 4-bit + RAG
+2,gemma_e2b_two_agent_quant_council,2,science,Gemma 4-bit council
+3,qwen_2b_routed_rag,3,math,Qwen 2B 4-bit + RAG
+4,gemma_e2b_routed_rag,4,philosophy_psychology,Gemma E2B 4-bit + RAG
+5,qwen_2b_routed_rag,5,news,Qwen 2B 4-bit + RAG
